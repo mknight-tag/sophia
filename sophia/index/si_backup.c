@@ -29,7 +29,7 @@ si_backupend(si *index, sdc *c, siplan *plan)
 	         index->scheme->name);
 
 	/* prepare buffer */
-	ssize_t size = ss_filesize(src);
+	ssize_t size = ss_vfssize(r->vfs, src);
 	if (ssunlikely(size == -1)) {
 		sr_error(r->e, "backup db file '%s' read error: %s",
 		         src, strerror(errno));
@@ -41,7 +41,7 @@ si_backupend(si *index, sdc *c, siplan *plan)
 
 	/* read scheme file */
 	ssfile file;
-	ss_fileinit(&file, r->a);
+	ss_fileinit(&file, r->vfs);
 	rc = ss_fileopen(&file, src);
 	if (ssunlikely(rc == -1)) {
 		sr_error(r->e, "backup db file '%s' open error: %s",
@@ -58,6 +58,7 @@ si_backupend(si *index, sdc *c, siplan *plan)
 	ss_fileclose(&file);
 
 	/* write scheme file */
+	ss_fileinit(&file, r->vfs);
 	rc = ss_filenew(&file, dst);
 	if (ssunlikely(rc == -1)) {
 		sr_error(r->e, "backup db file '%s' create error: %s",
@@ -89,7 +90,6 @@ si_backupend(si *index, sdc *c, siplan *plan)
 int si_backup(si *index, sdc *c, siplan *plan)
 {
 	sr *r = index->r;
-	sd_creset(c);
 	if (ssunlikely(plan->plan == SI_BACKUPEND))
 		return si_backupend(index, c, plan);
 
@@ -101,22 +101,15 @@ int si_backup(si *index, sdc *c, siplan *plan)
 	         index->scheme->name);
 
 	/* read origin file */
-	int rc = ss_bufensure(&c->c, r->a, node->file.size);
+	int rc = si_noderead(node, r, &c->c);
 	if (ssunlikely(rc == -1))
-		return sr_oom(r->e);
-	rc = ss_filepread(&node->file, 0, c->c.s, node->file.size);
-	if (ssunlikely(rc == -1)) {
-		sr_error(r->e, "db file '%s' read error: %s",
-		         node->file.file, strerror(errno));
 		return -1;
-	}
-	ss_bufadvance(&c->c, node->file.size);
 
 	/* copy */
 	sspath path;
-	ss_pathA(&path, dst, node->self.id.id, ".db");
+	ss_path(&path, dst, node->self.id.id, ".db");
 	ssfile file;
-	ss_fileinit(&file, r->a);
+	ss_fileinit(&file, r->vfs);
 	rc = ss_filenew(&file, path.path);
 	if (ssunlikely(rc == -1)) {
 		sr_error(r->e, "backup db file '%s' create error: %s",

@@ -19,65 +19,25 @@
 #include <libsy.h>
 #include <libse.h>
 
-static void*
-se_asyncbegin(so *o)
-{
-	se *e = se_of(o);
-	return se_txnew(e, 1);
-}
-
-static soif seasyncif =
-{
-	.open         = NULL,
-	.destroy      = NULL,
-	.error        = NULL,
-	.object       = NULL,
-	.asynchronous = NULL,
-	.poll         = NULL,
-	.drop         = NULL,
-	.setobject    = NULL,
-	.setstring    = NULL,
-	.setint       = NULL,
-	.getobject    = NULL,
-	.getstring    = NULL,
-	.getint       = NULL,
-	.set          = NULL,
-	.update       = NULL,
-	.del          = NULL,
-	.get          = NULL,
-	.batch        = NULL,
-	.begin        = se_asyncbegin,
-	.prepare      = NULL,
-	.commit       = NULL,
-	.cursor       = NULL,
-};
-
-static void*
-se_async(so *o)
-{
-	se *e = se_cast(o, se*, SE);
-	return &e->async;
-}
-
 static int
 se_open(so *o)
 {
 	se *e = se_cast(o, se*, SE);
 	int status = se_status(&e->status);
 	if (status == SE_RECOVER) {
-		assert(e->meta.two_phase_recover == 1);
+		assert(e->conf.two_phase_recover == 1);
 		goto online;
 	}
 	if (status != SE_OFFLINE)
 		return -1;
 	int rc;
-	rc = se_metavalidate(&e->meta);
+	rc = se_confvalidate(&e->conf);
 	if (ssunlikely(rc == -1))
 		return -1;
 	se_statusset(&e->status, SE_RECOVER);
 
 	/* set memory quota (disable during recovery) */
-	ss_quotaset(&e->quota, e->meta.memory_limit);
+	ss_quotaset(&e->quota, e->conf.memory_limit);
 	ss_quotaenable(&e->quota, 0);
 
 	/* repository recover */
@@ -96,7 +56,7 @@ se_open(so *o)
 	rc = se_recover(e);
 	if (ssunlikely(rc == -1))
 		return -1;
-	if (e->meta.two_phase_recover)
+	if (e->conf.two_phase_recover)
 		return 0;
 
 online:
@@ -136,13 +96,16 @@ se_destroy(so *o)
 	rc = so_listdestroy(&e->reqready);
 	if (ssunlikely(rc == -1))
 		rcret = -1;
+	rc = so_listdestroy(&e->cursor);
+	if (ssunlikely(rc == -1))
+		rcret = -1;
 	rc = so_listdestroy(&e->tx);
 	if (ssunlikely(rc == -1))
 		rcret = -1;
-	rc = so_listdestroy(&e->snapshot);
+	rc = so_listdestroy(&e->confcursor);
 	if (ssunlikely(rc == -1))
 		rcret = -1;
-	rc = so_listdestroy(&e->metacursor);
+	rc = so_listdestroy(&e->dbcursor);
 	if (ssunlikely(rc == -1))
 		rcret = -1;
 	rc = so_listdestroy(&e->db);
@@ -158,17 +121,19 @@ se_destroy(so *o)
 	if (ssunlikely(rc == -1))
 		rcret = -1;
 	sx_managerfree(&e->xm);
+	ss_vfsfree(&e->vfs);
 	si_cachepool_free(&e->cachepool, &e->r);
-	se_metafree(&e->meta);
+	se_conffree(&e->conf);
 	ss_quotafree(&e->quota);
 	ss_mutexfree(&e->apilock);
 	ss_mutexfree(&e->reqlock);
 	ss_condfree(&e->reqcond);
 	ss_spinlockfree(&e->dblock);
+	sr_statfree(&e->stat);
 	sr_seqfree(&e->seq);
 	ss_pagerfree(&e->pager);
-	ss_pagerfree(&e->pagersx);
 	se_statusfree(&e->status);
+	se_mark_destroyed(&e->o);
 	free(e);
 	return rcret;
 }
@@ -177,32 +142,32 @@ static void*
 se_begin(so *o)
 {
 	se *e = se_of(o);
-	return se_txnew(e, 0);
+	return se_txnew(e);
 }
 
 static void*
 se_poll(so *o)
 {
 	se *e = se_cast(o, se*, SE);
-	if (e->meta.event_on_backup) {
+	so *result;
+	if (e->conf.event_on_backup) {
 		ss_mutexlock(&e->sched.lock);
 		if (ssunlikely(e->sched.backup_events > 0)) {
 			e->sched.backup_events--;
-			serequest *req = se_requestnew(e, SE_REQON_BACKUP, &e->o, NULL);
-			if (ssunlikely(req == NULL)) {
-				ss_mutexunlock(&e->sched.lock);
-				return NULL;
-			}
+			sereq r;
+			se_reqinit(e, &r, SE_REQON_BACKUP, &e->o, NULL);
+			result = se_reqresult(&r, 1);
 			ss_mutexunlock(&e->sched.lock);
-			return &req->o;
+			return result;
 		}
 		ss_mutexunlock(&e->sched.lock);
 	}
-	serequest *req = se_requestdispatch_ready(e);
+	sereq *req = se_reqdispatch_ready(e);
 	if (req == NULL)
 		return NULL;
-	se_requestresult(req);
-	return &req->o;
+	result = se_reqresult(req, 1);
+	so_destroy(&req->o);
+	return result;
 }
 
 static int
@@ -218,30 +183,34 @@ se_error(so *o)
 	return 0;
 }
 
+static void*
+se_cursor(so *o)
+{
+	se *e = se_cast(o, se*, SE);
+	return se_cursornew(e, 0);
+}
+
 static soif seif =
 {
 	.open         = se_open,
 	.destroy      = se_destroy,
 	.error        = se_error,
-	.object       = NULL,
-	.asynchronous = se_async,
+	.document     = NULL,
 	.poll         = se_poll,
 	.drop         = NULL,
-	.setobject    = se_metaset_object,
-	.setstring    = se_metaset_string,
-	.setint       = se_metaset_int,
-	.getobject    = se_metaget_object,
-	.getstring    = se_metaget_string,
-	.getint       = se_metaget_int,
+	.setstring    = se_confset_string,
+	.setint       = se_confset_int,
+	.getobject    = se_confget_object,
+	.getstring    = se_confget_string,
+	.getint       = se_confget_int,
 	.set          = NULL,
-	.update       = NULL,
+	.upsert       = NULL,
 	.del          = NULL,
 	.get          = NULL,
-	.batch        = NULL,
 	.begin        = se_begin,
 	.prepare      = NULL,
 	.commit       = NULL,
-	.cursor       = se_metacursor,
+	.cursor       = se_cursor,
 };
 
 so *se_new(void)
@@ -251,41 +220,42 @@ so *se_new(void)
 		return NULL;
 	memset(e, 0, sizeof(*e));
 	so_init(&e->o, &se_o[SE], &seif, &e->o, &e->o /* self */);
-	so_init(&e->async, &se_o[SEASYNC], &seasyncif, &e->o, &e->o);
 	se_statusinit(&e->status);
 	se_statusset(&e->status, SE_OFFLINE);
-	ss_pagerinit(&e->pager, 10, 4096);
+	ss_vfsinit(&e->vfs, &ss_stdvfs);
+	ss_pagerinit(&e->pager, &e->vfs, 10, 8192);
 	int rc = ss_pageradd(&e->pager);
 	if (ssunlikely(rc == -1)) {
-		free(e);
-		return NULL;
-	}
-	ss_pagerinit(&e->pagersx, 10, 4096);
-	rc = ss_pageradd(&e->pagersx);
-	if (ssunlikely(rc == -1)) {
+		se_statusfree(&e->status);
 		ss_pagerfree(&e->pager);
 		free(e);
 		return NULL;
 	}
 	ss_aopen(&e->a, &ss_stda);
 	ss_aopen(&e->a_db, &ss_slaba, &e->pager, sizeof(sedb));
-	ss_aopen(&e->a_v, &ss_slaba, &e->pager, sizeof(sev));
+	ss_aopen(&e->a_dbcursor, &ss_slaba, &e->pager, sizeof(sedbcursor));
+	ss_aopen(&e->a_document, &ss_slaba, &e->pager, sizeof(sedocument));
 	ss_aopen(&e->a_cursor, &ss_slaba, &e->pager, sizeof(secursor));
 	ss_aopen(&e->a_cachebranch, &ss_slaba, &e->pager, sizeof(sicachebranch));
 	ss_aopen(&e->a_cache, &ss_slaba, &e->pager, sizeof(sicache));
-	ss_aopen(&e->a_metacursor, &ss_slaba, &e->pager, sizeof(semetacursor));
-	ss_aopen(&e->a_metav, &ss_slaba, &e->pager, sizeof(semetav));
-	ss_aopen(&e->a_snapshot, &ss_slaba, &e->pager, sizeof(sesnapshot));
-	ss_aopen(&e->a_batch, &ss_slaba, &e->pager, sizeof(sebatch));
+	ss_aopen(&e->a_confcursor, &ss_slaba, &e->pager, sizeof(seconfcursor));
+	ss_aopen(&e->a_confkv, &ss_slaba, &e->pager, sizeof(seconfkv));
 	ss_aopen(&e->a_tx, &ss_slaba, &e->pager, sizeof(setx));
-	ss_aopen(&e->a_req, &ss_slaba, &e->pager, sizeof(serequest));
-	ss_aopen(&e->a_sxv, &ss_slaba, &e->pagersx, sizeof(sxv));
-	se_metainit(&e->meta, &e->o);
+	ss_aopen(&e->a_req, &ss_slaba, &e->pager, sizeof(sereq));
+	ss_aopen(&e->a_sxv, &ss_slaba, &e->pager, sizeof(sxv));
+	rc = se_confinit(&e->conf, &e->o);
+	if (ssunlikely(rc == -1)) {
+		se_statusfree(&e->status);
+		ss_pagerfree(&e->pager);
+		free(e);
+		return NULL;
+	}
 	so_listinit(&e->db);
 	so_listinit(&e->db_shutdown);
+	so_listinit(&e->dbcursor);
+	so_listinit(&e->cursor);
 	so_listinit(&e->tx);
-	so_listinit(&e->snapshot);
-	so_listinit(&e->metacursor);
+	so_listinit(&e->confcursor);
 	so_listinit(&e->req);
 	so_listinit(&e->reqready);
 	so_listinit(&e->reqactive);
@@ -296,13 +266,14 @@ so *se_new(void)
 	ss_quotainit(&e->quota);
 	sr_seqinit(&e->seq);
 	sr_errorinit(&e->error);
+	sr_statinit(&e->stat);
 	sscrcf crc = ss_crc32c_function();
-	sr_init(&e->r, &e->error, &e->a, &e->quota, &e->seq,
+	sr_init(&e->r, &e->error, &e->a, &e->vfs, &e->quota, &e->seq,
 	        SF_KV, SF_SRAW, NULL,
-	        &e->meta.scheme, &e->ei, crc, NULL);
+	        &e->conf.scheme, &e->ei, &e->stat, crc);
 	sy_init(&e->rep);
 	sl_poolinit(&e->lp, &e->r);
-	sx_managerinit(&e->xm, &e->seq, &e->a, &e->a_sxv);
+	sx_managerinit(&e->xm, &e->r, &e->a_sxv);
 	si_cachepool_init(&e->cachepool, &e->a_cache, &e->a_cachebranch);
 	se_scheduler_init(&e->sched, &e->o);
 	return &e->o;

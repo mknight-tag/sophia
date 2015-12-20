@@ -14,346 +14,330 @@
 #include <libsd.h>
 #include <libsi.h>
 
-static int
-si_redistribute(si *index, sr *r, sdc *c, sinode *node, ssbuf *result)
-{
-	(void)index;
-	svindex *vindex = si_nodeindex(node);
-	ssiter i;
-	ss_iterinit(sv_indexiterraw, &i);
-	ss_iteropen(sv_indexiterraw, &i, vindex);
-	while (ss_iterhas(sv_indexiterraw, &i))
-	{
-		sv *v = ss_iterof(sv_indexiterraw, &i);
-		int rc = ss_bufadd(&c->b, r->a, &v->v, sizeof(svv**));
-		if (ssunlikely(rc == -1))
-			return sr_oom_malfunction(r->e);
-		ss_iternext(sv_indexiterraw, &i);
-	}
-	if (ssunlikely(ss_bufused(&c->b) == 0))
-		return 0;
-	ss_iterinit(ss_bufiterref, &i);
-	ss_iteropen(ss_bufiterref, &i, &c->b, sizeof(svv*));
-	ssiter j;
-	ss_iterinit(ss_bufiterref, &j);
-	ss_iteropen(ss_bufiterref, &j, result, sizeof(sinode*));
-	sinode *prev = ss_iterof(ss_bufiterref, &j);
-	ss_iternext(ss_bufiterref, &j);
-	while (1)
-	{
-		sinode *p = ss_iterof(ss_bufiterref, &j);
-		if (p == NULL) {
-			assert(prev != NULL);
-			while (ss_iterhas(ss_bufiterref, &i)) {
-				svv *v = ss_iterof(ss_bufiterref, &i);
-				v->next = NULL;
-				sv_indexset(&prev->i0, r, v);
-				ss_iternext(ss_bufiterref, &i);
-			}
-			break;
-		}
-		while (ss_iterhas(ss_bufiterref, &i))
-		{
-			svv *v = ss_iterof(ss_bufiterref, &i);
-			v->next = NULL;
-			sdindexpage *page = sd_indexmin(&p->self.index);
-			int rc = sr_compare(r->scheme, sv_vpointer(v), v->size,
-			                    sd_indexpage_min(&p->self.index, page),
-			                    page->sizemin);
-			if (ssunlikely(rc >= 0))
-				break;
-			sv_indexset(&prev->i0, r, v);
-			ss_iternext(ss_bufiterref, &i);
-		}
-		if (ssunlikely(! ss_iterhas(ss_bufiterref, &i)))
-			break;
-		prev = p;
-		ss_iternext(ss_bufiterref, &j);
-	}
-	assert(ss_iterof(ss_bufiterref, &i) == NULL);
-	return 0;
-}
-
-static inline void
-si_redistribute_set(si *index, sr *r, uint64_t now, svv *v)
-{
-	index->update_time = now;
-	/* match node */
-	ssiter i;
-	ss_iterinit(si_iter, &i);
-	ss_iteropen(si_iter, &i, r, index, SS_ROUTE, sv_vpointer(v), v->size);
-	sinode *node = ss_iterof(si_iter, &i);
-	assert(node != NULL);
-	/* update node */
-	svindex *vindex = si_nodeindex(node);
-	sv_indexset(vindex, r, v);
-	node->update_time = index->update_time;
-	node->used += sv_vsize(v);
-	/* schedule node */
-	si_plannerupdate(&index->p, SI_BRANCH, node);
-}
-
-static int
-si_redistribute_index(si *index, sr *r, sdc *c, sinode *node)
-{
-	svindex *vindex = si_nodeindex(node);
-	ssiter i;
-	ss_iterinit(sv_indexiterraw, &i);
-	ss_iteropen(sv_indexiterraw, &i, vindex);
-	while (ss_iterhas(sv_indexiterraw, &i)) {
-		sv *v = ss_iterof(sv_indexiterraw, &i);
-		int rc = ss_bufadd(&c->b, r->a, &v->v, sizeof(svv**));
-		if (ssunlikely(rc == -1))
-			return sr_oom_malfunction(r->e);
-		ss_iternext(sv_indexiterraw, &i);
-	}
-	if (ssunlikely(ss_bufused(&c->b) == 0))
-		return 0;
-	uint64_t now = ss_utime();
-	ss_iterinit(ss_bufiterref, &i);
-	ss_iteropen(ss_bufiterref, &i, &c->b, sizeof(svv*));
-	while (ss_iterhas(ss_bufiterref, &i)) {
-		svv *v = ss_iterof(ss_bufiterref, &i);
-		si_redistribute_set(index, r, now, v);
-		ss_iternext(ss_bufiterref, &i);
-	}
-	return 0;
-}
-
-static int
-si_splitfree(ssbuf *result, sr *r)
-{
-	ssiter i;
-	ss_iterinit(ss_bufiterref, &i);
-	ss_iteropen(ss_bufiterref, &i, result, sizeof(sinode*));
-	while (ss_iterhas(ss_bufiterref, &i))
-	{
-		sinode *p = ss_iterof(ss_bufiterref, &i);
-		si_nodefree(p, r, 0);
-		ss_iternext(ss_bufiterref, &i);
-	}
-	return 0;
-}
-
-static inline int
-si_split(si *index, sdc *c, ssbuf *result,
-         sinode   *parent,
-         ssiter   *i,
-         uint64_t  size_node,
-         uint32_t  size_stream,
-         uint64_t  vlsn)
+static inline sibranch*
+si_branchcreate(si *index, sdc *c, sinode *parent, svindex *vindex, uint64_t vlsn)
 {
 	sr *r = index->r;
-	int count = 0;
+	sibranch *branch = NULL;
+
+	/* in-memory mode blob */
 	int rc;
-	sdmergeconf mergeconf = {
-		.size_stream     = size_stream,
-		.size_node       = size_node,
-		.size_page       = index->scheme->node_page_size,
-		.checksum        = index->scheme->node_page_checksum,
-		.compression     = index->scheme->compression,
-		.compression_key = index->scheme->compression_key,
-		.offset          = 0,
-		.vlsn            = vlsn,
-		.save_delete     = 0
-	};
-	sdmerge merge;
-	sd_mergeinit(&merge, r, i, &c->build, &mergeconf);
-	while ((rc = sd_merge(&merge)) > 0)
-	{
-		sinode *n = si_nodenew(r);
-		if (ssunlikely(n == NULL))
-			goto error;
-		sdid id = {
-			.parent = parent->self.id.id,
-			.flags  = 0,
-			.id     = sr_seq(index->r->seq, SR_NSNNEXT)
-		};
-		rc = sd_mergecommit(&merge, &id);
-		if (ssunlikely(rc == -1))
-			goto error;
-		rc = si_nodecreate(n, r, index->scheme, &id, &merge.index, &c->build);
-		if (ssunlikely(rc == -1))
-			goto error;
-		rc = ss_bufadd(result, index->r->a, &n, sizeof(sinode*));
-		if (ssunlikely(rc == -1)) {
-			sr_oom_malfunction(index->r->e);
-			si_nodefree(n, r, 1);
-			goto error;
-		}
-		sd_buildreset(&c->build);
-		count++;
-	}
-	if (ssunlikely(rc == -1))
-		goto error;
-	return 0;
-error:
-	si_splitfree(result, r);
-	sd_mergefree(&merge);
-	return -1;
-}
-
-int si_compaction(si *index, sdc *c, uint64_t vlsn,
-                  sinode *node,
-                  ssiter *stream, uint32_t size_stream)
-{
-	sr *r = index->r;
-	ssbuf *result = &c->a;
-	ssiter i;
-
-	/* begin compaction.
-	 *
-	 * split merge stream into a number
-	 * of a new nodes.
-	 */
-	int rc;
-	rc = si_split(index, c, result,
-	              node, stream,
-	              index->scheme->node_size,
-	              size_stream,
-	              vlsn);
-	if (ssunlikely(rc == -1))
-		return -1;
-
-	SS_INJECTION(r->i, SS_INJECTION_SI_COMPACTION_0,
-	             si_splitfree(result, r);
-	             sr_malfunction(r->e, "%s", "error injection");
-	             return -1);
-
-	/* mask removal of a single node as a
-	 * single node update */
-	int count = ss_bufused(result) / sizeof(sinode*);
-	int count_index;
-
-	si_lock(index);
-	count_index = index->n;
-	si_unlock(index);
-
-	sinode *n;
-	if (ssunlikely(count == 0 && count_index == 1))
-	{
-		n = si_bootstrap(index, node->self.id.id);
-		if (ssunlikely(n == NULL))
-			return -1;
-		rc = ss_bufadd(result, r->a, &n, sizeof(sinode*));
+	ssblob copy, *blob = NULL;
+	if (parent->in_memory) {
+		ss_blobinit(&copy, r->vfs);
+		rc = ss_blobensure(&copy, 10ULL * 1024 * 1024);
 		if (ssunlikely(rc == -1)) {
 			sr_oom_malfunction(r->e);
-			si_nodefree(n, r, 1);
-			return -1;
+			return NULL;
 		}
-		count++;
+		blob = &copy;
 	}
 
-	/* commit compaction changes */
-	si_lock(index);
-	svindex *j = si_nodeindex(node);
-	si_plannerremove(&index->p, SI_COMPACT|SI_BRANCH, node);
-	switch (count) {
-	case 0: /* delete */
-		si_remove(index, node);
-		si_redistribute_index(index, r, c, node);
-		uint32_t used = sv_indexused(j);
-		if (used) {
-			ss_quota(r->quota, SS_QREMOVE, used);
+	svmerge vmerge;
+	sv_mergeinit(&vmerge);
+	rc = sv_mergeprepare(&vmerge, r, 1);
+	if (ssunlikely(rc == -1))
+		return NULL;
+	svmergesrc *s = sv_mergeadd(&vmerge, NULL);
+	ss_iterinit(sv_indexiter, &s->src);
+	ss_iteropen(sv_indexiter, &s->src, r, vindex, SS_GTE, NULL, 0);
+	ssiter i;
+	ss_iterinit(sv_mergeiter, &i);
+	ss_iteropen(sv_mergeiter, &i, r, &vmerge, SS_GTE);
+
+	/* merge iter is not used */
+	sdmergeconf mergeconf = {
+		.size_stream     = UINT32_MAX,
+		.size_node       = UINT64_MAX,
+		.size_page       = index->scheme->node_page_size,
+		.checksum        = index->scheme->node_page_checksum,
+		.compression_key = index->scheme->compression_key,
+		.compression     = index->scheme->compression_branch,
+		.compression_if  = index->scheme->compression_branch_if,
+		.vlsn            = vlsn,
+		.vlsn_lru        = 0,
+		.save_delete     = 1,
+		.save_upsert     = 1
+	};
+	sdmerge merge;
+	sd_mergeinit(&merge, r, &i, &c->build, &c->upsert, &mergeconf);
+
+	while ((rc = sd_merge(&merge)) > 0)
+	{
+		assert(branch == NULL);
+
+		/* write open seal */
+		uint64_t seal = parent->file.size;
+		rc = sd_writeseal(r, &parent->file, blob);
+		if (ssunlikely(rc == -1))
+			goto e0;
+
+		/* write pages */
+		uint64_t offset = parent->file.size;
+		while ((rc = sd_mergepage(&merge, offset)) == 1)
+		{
+			rc = sd_writepage(r, &parent->file, blob, merge.build);
+			if (ssunlikely(rc == -1))
+				goto e0;
+			offset = parent->file.size;
 		}
-		break;
-	case 1: /* self update */
-		n = *(sinode**)result->s;
-		n->i0   = *j;
-		n->used = sv_indexused(j);
-		si_nodelock(n);
-		si_replace(index, node, n);
-		si_plannerupdate(&index->p, SI_COMPACT|SI_BRANCH, n);
-		break;
-	default: /* split */
-		rc = si_redistribute(index, r, c, node, result);
-		if (ssunlikely(rc == -1)) {
-			si_unlock(index);
-			si_splitfree(result, r);
-			return -1;
+		if (ssunlikely(rc == -1))
+			goto e0;
+		sdid id = {
+			.parent = parent->self.id.id,
+			.flags  = SD_IDBRANCH,
+			.id     = sr_seq(r->seq, SR_NSNNEXT)
+		};
+		rc = sd_mergecommit(&merge, &id, parent->file.size);
+		if (ssunlikely(rc == -1))
+			goto e0;
+
+		/* write index */
+		rc = sd_writeindex(r, &parent->file, blob, &merge.index);
+		if (ssunlikely(rc == -1))
+			goto e0;
+		if (index->scheme->sync) {
+			rc = ss_filesync(&parent->file);
+			if (ssunlikely(rc == -1)) {
+				sr_malfunction(r->e, "file '%s' sync error: %s",
+				               ss_pathof(&parent->file.path),
+				               strerror(errno));
+				goto e0;
+			}
 		}
-		ss_iterinit(ss_bufiterref, &i);
-		ss_iteropen(ss_bufiterref, &i, result, sizeof(sinode*));
-		n = ss_iterof(ss_bufiterref, &i);
-		n->used = sv_indexused(&n->i0);
-		si_nodelock(n);
-		si_replace(index, node, n);
-		si_plannerupdate(&index->p, SI_COMPACT|SI_BRANCH, n);
-		for (ss_iternext(ss_bufiterref, &i); ss_iterhas(ss_bufiterref, &i);
-		     ss_iternext(ss_bufiterref, &i)) {
-			n = ss_iterof(ss_bufiterref, &i);
-			n->used = sv_indexused(&n->i0);
-			si_nodelock(n);
-			si_insert(index, n);
-			si_plannerupdate(&index->p, SI_COMPACT|SI_BRANCH, n);
+
+		SS_INJECTION(r->i, SS_INJECTION_SI_BRANCH_0,
+		             sd_mergefree(&merge);
+		             sr_malfunction(r->e, "%s", "error injection");
+		             return NULL);
+
+		/* seal the branch */
+		rc = sd_seal(r, &parent->file, blob, &merge.index, seal);
+		if (ssunlikely(rc == -1))
+			goto e0;
+		if (index->scheme->sync == 2) {
+			rc = ss_filesync(&parent->file);
+			if (ssunlikely(rc == -1)) {
+				sr_malfunction(r->e, "file '%s' sync error: %s",
+				               ss_pathof(&parent->file.path),
+				               strerror(errno));
+				goto e0;
+			}
 		}
-		break;
+
+		/* create new branch object */
+		branch = si_branchnew(r);
+		if (ssunlikely(branch == NULL))
+			goto e0;
+		si_branchset(branch, &merge.index);
 	}
-	sv_indexinit(j);
+	sv_mergefree(&vmerge, r->a);
+
+	if (ssunlikely(rc == -1)) {
+		sr_oom_malfunction(r->e);
+		goto e0;
+	}
+	assert(branch != NULL);
+
+	/* in-memory mode support */
+	if (blob) {
+		rc = ss_blobfit(blob);
+		if (ssunlikely(rc == -1)) {
+			ss_blobfree(blob);
+			goto e1;
+		}
+		branch->copy = copy;
+	}
+	/* mmap support */
+	if (index->scheme->mmap) {
+		ss_mmapinit(&parent->map_swap);
+		rc = ss_vfsmmap(r->vfs, &parent->map_swap, parent->file.fd,
+		              parent->file.size, 1);
+		if (ssunlikely(rc == -1)) {
+			sr_malfunction(r->e, "db file '%s' mmap error: %s",
+			               ss_pathof(&parent->file.path),
+			               strerror(errno));
+			goto e1;
+		}
+	}
+	return branch;
+e0:
+	sd_mergefree(&merge);
+	if (blob)
+		ss_blobfree(blob);
+	return NULL;
+e1:
+	si_branchfree(branch, r);
+	return NULL;
+}
+
+int si_branch(si *index, sdc *c, siplan *plan, uint64_t vlsn)
+{
+	sr *r = index->r;
+	sinode *n = plan->node;
+	assert(n->flags & SI_LOCK);
+
+	si_lock(index);
+	if (ssunlikely(n->used == 0)) {
+		si_nodeunlock(n);
+		si_unlock(index);
+		return 0;
+	}
+	svindex *i;
+	i = si_noderotate(n);
 	si_unlock(index);
 
-	/* compaction completion */
+	sibranch *branch = si_branchcreate(index, c, n, i, vlsn);
+	if (ssunlikely(branch == NULL))
+		return -1;
 
-	/* seal nodes */
-	ss_iterinit(ss_bufiterref, &i);
-	ss_iteropen(ss_bufiterref, &i, result, sizeof(sinode*));
-	while (ss_iterhas(ss_bufiterref, &i))
-	{
-		n = ss_iterof(ss_bufiterref, &i);
-		if (index->scheme->sync) {
-			rc = si_nodesync(n, r);
-			if (ssunlikely(rc == -1))
-				return -1;
-		}
-		rc = si_nodeseal(n, r, index->scheme);
-		if (ssunlikely(rc == -1))
+	/* commit */
+	si_lock(index);
+	branch->next = n->branch;
+	n->branch->link = branch;
+	n->branch = branch;
+	n->branch_count++;
+	uint32_t used = sv_indexused(i);
+	n->used -= used;
+	ss_quota(r->quota, SS_QREMOVE, used);
+	index->size +=
+		sd_indexsize(branch->index.h) +
+		sd_indextotal(&branch->index);
+	svindex swap = *i;
+	si_nodeunrotate(n);
+	si_nodeunlock(n);
+	si_plannerupdate(&index->p, SI_BRANCH|SI_COMPACT, n);
+	ssmmap swap_map = n->map;
+	n->map = n->map_swap;
+	memset(&n->map_swap, 0, sizeof(n->map_swap));
+	si_unlock(index);
+
+	/* gc */
+	if (index->scheme->mmap) {
+		int rc = ss_vfsmunmap(r->vfs, &swap_map);
+		if (ssunlikely(rc == -1)) {
+			sr_malfunction(r->e, "db file '%s' munmap error: %s",
+			               ss_pathof(&n->file.path),
+			               strerror(errno));
 			return -1;
-		SS_INJECTION(r->i, SS_INJECTION_SI_COMPACTION_3,
-		             si_nodefree(node, r, 0);
-		             sr_malfunction(r->e, "%s", "error injection");
-		             return -1);
-		ss_iternext(ss_bufiterref, &i);
+		}
 	}
+	si_nodegc_index(r, &swap);
+	return 1;
+}
 
-	SS_INJECTION(r->i, SS_INJECTION_SI_COMPACTION_1,
-	             si_nodefree(node, r, 0);
-	             sr_malfunction(r->e, "%s", "error injection");
-	             return -1);
+int si_compact(si *index, sdc *c, siplan *plan,
+               uint64_t vlsn,
+               uint64_t vlsn_lru,
+               ssiter *vindex,
+               uint64_t vindex_used)
+{
+	sr *r = index->r;
+	sinode *node = plan->node;
+	assert(node->flags & SI_LOCK);
 
-	/* gc old node */
-	rc = si_nodefree(node, r, 1);
+	/* prepare for compaction */
+	int rc;
+	rc = sd_censure(c, r, node->branch_count);
+	if (ssunlikely(rc == -1))
+		return sr_oom_malfunction(r->e);
+	svmerge merge;
+	sv_mergeinit(&merge);
+	rc = sv_mergeprepare(&merge, r, node->branch_count + 1);
 	if (ssunlikely(rc == -1))
 		return -1;
 
-	SS_INJECTION(r->i, SS_INJECTION_SI_COMPACTION_2,
-	             sr_malfunction(r->e, "%s", "error injection");
-	             return -1);
-
-	/* complete new nodes */
-	ss_iterinit(ss_bufiterref, &i);
-	ss_iteropen(ss_bufiterref, &i, result, sizeof(sinode*));
-	while (ss_iterhas(ss_bufiterref, &i))
-	{
-		n = ss_iterof(ss_bufiterref, &i);
-		rc = si_nodecomplete(n, r, index->scheme);
+	/* read node file into memory */
+	int use_mmap = index->scheme->mmap;
+	ssmmap *map = &node->map;
+	ssmmap  preload;
+	if (index->scheme->node_compact_load) {
+		rc = si_noderead(node, r, &c->c);
 		if (ssunlikely(rc == -1))
 			return -1;
-		SS_INJECTION(r->i, SS_INJECTION_SI_COMPACTION_4,
-		             sr_malfunction(r->e, "%s", "error injection");
-		             return -1);
-		ss_iternext(ss_bufiterref, &i);
+		preload.p = c->c.s;
+		preload.size = ss_bufused(&c->c);
+		map = &preload;
+		use_mmap = 1;
 	}
 
-	/* unlock */
-	si_lock(index);
-	ss_iterinit(ss_bufiterref, &i);
-	ss_iteropen(ss_bufiterref, &i, result, sizeof(sinode*));
-	while (ss_iterhas(ss_bufiterref, &i))
-	{
-		n = ss_iterof(ss_bufiterref, &i);
-		si_nodeunlock(n);
-		ss_iternext(ss_bufiterref, &i);
+	/* include vindex into merge process */
+	svmergesrc *s;
+	uint64_t size_stream = 0;
+	if (vindex) {
+		s = sv_mergeadd(&merge, vindex);
+		size_stream = vindex_used;
 	}
+
+	sdcbuf *cbuf = c->head;
+	sibranch *b = node->branch;
+	while (b) {
+		s = sv_mergeadd(&merge, NULL);
+		/* choose compression type */
+		int compression;
+		ssfilterif *compression_if;
+		if (! si_branchis_root(b)) {
+			compression    = index->scheme->compression_branch;
+			compression_if = index->scheme->compression_branch_if;
+		} else {
+			compression    = index->scheme->compression;
+			compression_if = index->scheme->compression_if;
+		}
+		sdreadarg arg = {
+			.index           = &b->index,
+			.buf             = &cbuf->a,
+			.buf_xf          = &cbuf->b,
+			.buf_read        = &c->d,
+			.index_iter      = &cbuf->index_iter,
+			.page_iter       = &cbuf->page_iter,
+			.use_memory      = node->in_memory,
+			.use_mmap        = use_mmap,
+			.use_mmap_copy   = 0,
+			.use_compression = compression,
+			.compression_if  = compression_if,
+			.has             = 0,
+			.has_vlsn        = 0,
+			.o               = SS_GTE,
+			.memory          = &b->copy,
+			.mmap            = map,
+			.file            = &node->file,
+			.r               = r
+		};
+		ss_iterinit(sd_read, &s->src);
+		int rc = ss_iteropen(sd_read, &s->src, &arg, NULL, 0);
+		if (ssunlikely(rc == -1))
+			return sr_oom_malfunction(r->e);
+		size_stream += sd_indextotal(&b->index);
+		cbuf = cbuf->next;
+		b = b->next;
+	}
+	ssiter i;
+	ss_iterinit(sv_mergeiter, &i);
+	ss_iteropen(sv_mergeiter, &i, r, &merge, SS_GTE);
+	rc = si_merge(index, c, node, vlsn, vlsn_lru, &i, size_stream);
+	sv_mergefree(&merge, r->a);
+	return rc;
+}
+
+int si_compact_index(si *index, sdc *c, siplan *plan,
+                     uint64_t vlsn,
+                     uint64_t vlsn_lru)
+{
+	sinode *node = plan->node;
+
+	si_lock(index);
+	if (ssunlikely(node->used == 0)) {
+		si_nodeunlock(node);
+		si_unlock(index);
+		return 0;
+	}
+	svindex *vindex;
+	vindex = si_noderotate(node);
 	si_unlock(index);
-	return 0;
+
+	uint64_t size_stream = sv_indexused(vindex);
+	ssiter i;
+	ss_iterinit(sv_indexiter, &i);
+	ss_iteropen(sv_indexiter, &i, index->r, vindex, SS_GTE, NULL, 0);
+	return si_compact(index, c, plan, vlsn, vlsn_lru, &i, size_stream);
 }

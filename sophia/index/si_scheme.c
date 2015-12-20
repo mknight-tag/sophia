@@ -25,7 +25,8 @@ enum {
 	SI_SCHEME_NODE_PAGE_CHECKSUM,
 	SI_SCHEME_SYNC,
 	SI_SCHEME_COMPRESSION,
-	SI_SCHEME_COMPRESSION_KEY
+	SI_SCHEME_COMPRESSION_KEY,
+	SI_SCHEME_COMPRESSION_BRANCH
 };
 
 void si_schemeinit(sischeme *s)
@@ -47,9 +48,17 @@ void si_schemefree(sischeme *s, sr *r)
 		ss_free(r->a, s->path_backup);
 		s->path_backup = NULL;
 	}
+	if (s->storage_sz) {
+		ss_free(r->a, s->storage_sz);
+		s->storage_sz = NULL;
+	}
 	if (s->compression_sz) {
 		ss_free(r->a, s->compression_sz);
 		s->compression_sz = NULL;
+	}
+	if (s->compression_branch_sz) {
+		ss_free(r->a, s->compression_branch_sz);
+		s->compression_branch_sz = NULL;
 	}
 	if (s->fmt_sz) {
 		ss_free(r->a, s->fmt_sz);
@@ -66,12 +75,12 @@ int si_schemedeploy(sischeme *s, sr *r)
 	rc = sd_schemebegin(&c, r);
 	if (ssunlikely(rc == -1))
 		return -1;
+	ssbuf buf;
+	ss_bufinit(&buf);
 	rc = sd_schemeadd(&c, r, SI_SCHEME_NAME, SS_STRING, s->name,
 	                  strlen(s->name) + 1);
 	if (ssunlikely(rc == -1))
 		goto error;
-	ssbuf buf;
-	ss_bufinit(&buf);
 	rc = sr_schemesave(&s->scheme, r->a, &buf);
 	if (ssunlikely(rc == -1))
 		goto error;
@@ -113,6 +122,11 @@ int si_schemedeploy(sischeme *s, sr *r)
 	                  strlen(s->compression_if->name) + 1);
 	if (ssunlikely(rc == -1))
 		goto error;
+	rc = sd_schemeadd(&c, r, SI_SCHEME_COMPRESSION_BRANCH, SS_STRING,
+	                  s->compression_branch_if->name,
+	                  strlen(s->compression_branch_if->name) + 1);
+	if (ssunlikely(rc == -1))
+		goto error;
 	rc = sd_schemeadd(&c, r, SI_SCHEME_COMPRESSION_KEY, SS_U32,
 	                  &s->compression_key,
 	                  sizeof(s->compression_key));
@@ -141,12 +155,12 @@ int si_schemerecover(sischeme *s, sr *r)
 	int rc;
 	rc = sd_schemerecover(&c, r, path);
 	if (ssunlikely(rc == -1))
-		return -1;
+		goto error;
 	ssiter i;
 	ss_iterinit(sd_schemeiter, &i);
 	rc = ss_iteropen(sd_schemeiter, &i, r, &c, 1);
 	if (ssunlikely(rc == -1))
-		return -1;
+		goto error;
 	while (ss_iterhas(sd_schemeiter, &i))
 	{
 		sdschemeopt *opt = ss_iterof(sd_schemeiter, &i);
@@ -191,16 +205,8 @@ int si_schemerecover(sischeme *s, sr *r)
 			break;
 		case SI_SCHEME_COMPRESSION: {
 			char *name = sd_schemesz(opt);
-			ssfilterif *cif = NULL;
-			if (strcmp(name, "none") == 0)
-				cif = &ss_nonefilter;
-			else
-			if (strcmp(name, "lz4") == 0)
-				cif = &ss_lz4filter;
-			else
-			if (strcmp(name, "zstd") == 0)
-				cif = &ss_zstdfilter;
-			else
+			ssfilterif *cif = ss_filterof(name);
+			if (ssunlikely(cif == NULL))
 				goto error;
 			s->compression_if = cif;
 			s->compression = s->compression_if != &ss_nonefilter;
@@ -210,6 +216,21 @@ int si_schemerecover(sischeme *s, sr *r)
 				goto error;
 			break;
 		}
+		case SI_SCHEME_COMPRESSION_BRANCH: {
+			char *name = sd_schemesz(opt);
+			ssfilterif *cif = ss_filterof(name);
+			if (ssunlikely(cif == NULL))
+				goto error;
+			s->compression_branch_if = cif;
+			s->compression_branch = s->compression_branch_if != &ss_nonefilter;
+			ss_free(r->a, s->compression_branch_sz);
+			s->compression_branch_sz = ss_strdup(r->a, cif->name);
+			if (ssunlikely(s->compression_branch_sz == NULL))
+				goto error;
+			break;
+		}
+		default: /* skip unknown */
+			break;
 		}
 		ss_iternext(sd_schemeiter, &i);
 	}

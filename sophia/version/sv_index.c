@@ -14,7 +14,7 @@
 #include <libsv.h>
 
 ss_rbtruncate(sv_indextruncate,
-              sv_vfree((ssa*)arg, sscast(n, svv, node)))
+              sv_vfreelist((sr*)arg, sscast(n, svv, node)))
 
 int sv_indexinit(svindex *i)
 {
@@ -28,7 +28,7 @@ int sv_indexinit(svindex *i)
 int sv_indexfree(svindex *i, sr *r)
 {
 	if (i->i.root)
-		sv_indextruncate(i->i.root, r->a);
+		sv_indextruncate(i->i.root, r);
 	ss_rbinit(&i->i);
 	return 0;
 }
@@ -36,6 +36,7 @@ int sv_indexfree(svindex *i, sr *r)
 static inline svv*
 sv_vset(svv *head, svv *v)
 {
+	assert(head->lsn != v->lsn);
 	/* default */
 	if (sslikely(head->lsn < v->lsn)) {
 		v->next = head;

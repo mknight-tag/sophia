@@ -23,7 +23,7 @@ static inline srzone*
 se_zoneof(se *e)
 {
 	int p = ss_quotaused_percent(&e->quota);
-	return sr_zonemap(&e->meta.zones, p);
+	return sr_zonemap(&e->conf.zones, p);
 }
 
 int se_scheduler_branch(void *arg)
@@ -36,6 +36,7 @@ int se_scheduler_branch(void *arg)
 	int rc;
 	while (1) {
 		uint64_t vlsn = sx_vlsn(&e->xm);
+		uint64_t vlsn_lru = si_lru_vlsn(&db->index);
 		siplan plan = {
 			.explain   = SI_ENONE,
 			.plan      = SI_BRANCH,
@@ -47,7 +48,7 @@ int se_scheduler_branch(void *arg)
 		rc = si_plan(&db->index, &plan);
 		if (rc == 0)
 			break;
-		rc = si_execute(&db->index, &stub.dc, &plan, vlsn);
+		rc = si_execute(&db->index, &stub.dc, &plan, vlsn, vlsn_lru);
 		if (ssunlikely(rc == -1))
 			break;
 	}
@@ -65,10 +66,41 @@ int se_scheduler_compact(void *arg)
 	int rc;
 	while (1) {
 		uint64_t vlsn = sx_vlsn(&e->xm);
+		uint64_t vlsn_lru = si_lru_vlsn(&db->index);
 		siplan plan = {
 			.explain   = SI_ENONE,
 			.plan      = SI_COMPACT,
 			.a         = z->compact_wm,
+			.b         = z->compact_mode,
+			.c         = 0,
+			.node      = NULL
+		};
+		rc = si_plan(&db->index, &plan);
+		if (rc == 0)
+			break;
+		rc = si_execute(&db->index, &stub.dc, &plan, vlsn, vlsn_lru);
+		if (ssunlikely(rc == -1))
+			break;
+	}
+	se_workerstub_free(&stub, &db->r);
+	return rc;
+}
+
+int se_scheduler_compact_index(void *arg)
+{
+	sedb *db = arg;
+	se *e = se_of(&db->o);
+	srzone *z = se_zoneof(e);
+	seworker stub;
+	se_workerstub_init(&stub);
+	int rc;
+	while (1) {
+		uint64_t vlsn = sx_vlsn(&e->xm);
+		uint64_t vlsn_lru = si_lru_vlsn(&db->index);
+		siplan plan = {
+			.explain   = SI_ENONE,
+			.plan      = SI_COMPACT_INDEX,
+			.a         = z->branch_wm,
 			.b         = 0,
 			.c         = 0,
 			.node      = NULL
@@ -76,12 +108,37 @@ int se_scheduler_compact(void *arg)
 		rc = si_plan(&db->index, &plan);
 		if (rc == 0)
 			break;
-		rc = si_execute(&db->index, &stub.dc, &plan, vlsn);
+		rc = si_execute(&db->index, &stub.dc, &plan, vlsn, vlsn_lru);
 		if (ssunlikely(rc == -1))
 			break;
 	}
 	se_workerstub_free(&stub, &db->r);
 	return rc;
+}
+
+int se_scheduler_anticache(void *arg)
+{
+	se *o = arg;
+	sescheduler *s = &o->sched;
+	uint64_t asn = sr_seq(&o->seq, SR_ASNNEXT);
+	ss_mutexlock(&s->lock);
+	s->anticache_asn = asn;
+	s->anticache_storage = o->conf.anticache;
+	s->anticache = 1;
+	ss_mutexunlock(&s->lock);
+	return 0;
+}
+
+int se_scheduler_snapshot(void *arg)
+{
+	se *o = arg;
+	sescheduler *s = &o->sched;
+	uint64_t ssn = sr_seq(&o->seq, SR_SSNNEXT);
+	ss_mutexlock(&s->lock);
+	s->snapshot_ssn = ssn;
+	s->snapshot = 1;
+	ss_mutexunlock(&s->lock);
+	return 0;
 }
 
 int se_scheduler_checkpoint(void *arg)
@@ -106,11 +163,21 @@ int se_scheduler_gc(void *arg)
 	return 0;
 }
 
+int se_scheduler_lru(void *arg)
+{
+	se *o = arg;
+	sescheduler *s = &o->sched;
+	ss_mutexlock(&s->lock);
+	s->lru = 1;
+	ss_mutexunlock(&s->lock);
+	return 0;
+}
+
 int se_scheduler_backup(void *arg)
 {
 	se *e = arg;
 	sescheduler *s = &e->sched;
-	if (ssunlikely(e->meta.backup_path == NULL)) {
+	if (ssunlikely(e->conf.backup_path == NULL)) {
 		sr_error(&e->error, "%s", "backup is not enabled");
 		return -1;
 	}
@@ -145,8 +212,8 @@ se_backupstart(sescheduler *s)
 	*/
 	char path[1024];
 	snprintf(path, sizeof(path), "%s/%" PRIu32 ".incomplete",
-	         e->meta.backup_path, s->backup_bsn);
-	int rc = ss_filemkdir(path);
+	         e->conf.backup_path, s->backup_bsn);
+	int rc = ss_vfsmkdir(&e->vfs, path, 0755);
 	if (ssunlikely(rc == -1)) {
 		sr_error(&e->error, "backup directory '%s' create error: %s",
 		         path, strerror(errno));
@@ -156,9 +223,9 @@ se_backupstart(sescheduler *s)
 	while (i < s->count) {
 		sedb *db = s->i[i];
 		snprintf(path, sizeof(path), "%s/%" PRIu32 ".incomplete/%s",
-		         e->meta.backup_path, s->backup_bsn,
+		         e->conf.backup_path, s->backup_bsn,
 		         db->scheme.name);
-		rc = ss_filemkdir(path);
+		rc = ss_vfsmkdir(&e->vfs, path, 0755);
 		if (ssunlikely(rc == -1)) {
 			sr_error(&e->error, "backup directory '%s' create error: %s",
 			         path, strerror(errno));
@@ -167,8 +234,8 @@ se_backupstart(sescheduler *s)
 		i++;
 	}
 	snprintf(path, sizeof(path), "%s/%" PRIu32 ".incomplete/log",
-	         e->meta.backup_path, s->backup_bsn);
-	rc = ss_filemkdir(path);
+	         e->conf.backup_path, s->backup_bsn);
+	rc = ss_vfsmkdir(&e->vfs, path, 0755);
 	if (ssunlikely(rc == -1)) {
 		sr_error(&e->error, "backup directory '%s' create error: %s",
 		         path, strerror(errno));
@@ -200,7 +267,7 @@ se_backupcomplete(sescheduler *s, seworker *w)
 
 	char path[1024];
 	snprintf(path, sizeof(path), "%s/%" PRIu32 ".incomplete/log",
-	         e->meta.backup_path, s->backup_bsn);
+	         e->conf.backup_path, s->backup_bsn);
 	rc = sl_poolcopy(&e->lp, path, &w->dc.c);
 	if (ssunlikely(rc == -1)) {
 		sr_errorrecover(&e->error);
@@ -212,10 +279,10 @@ se_backupcomplete(sescheduler *s, seworker *w)
 
 	/* complete backup */
 	snprintf(path, sizeof(path), "%s/%" PRIu32 ".incomplete",
-	         e->meta.backup_path, s->backup_bsn);
+	         e->conf.backup_path, s->backup_bsn);
 	char newpath[1024];
 	snprintf(newpath, sizeof(newpath), "%s/%" PRIu32,
-	         e->meta.backup_path, s->backup_bsn);
+	         e->conf.backup_path, s->backup_bsn);
 	rc = rename(path, newpath);
 	if (ssunlikely(rc == -1)) {
 		sr_error(&e->error, "backup directory '%s' rename error: %s",
@@ -224,8 +291,8 @@ se_backupcomplete(sescheduler *s, seworker *w)
 	}
 
 	/* complete */
-	s->backup_last = s->backup_bsn;
-	s->backup_last_complete = 1;
+	s->backup_bsn_last = s->backup_bsn;
+	s->backup_bsn_last_complete = 1;
 	s->backup = 0;
 	s->backup_bsn = 0;
 	return 0;
@@ -237,7 +304,7 @@ se_backuperror(sescheduler *s)
 	se *e = (se*)s->env;
 	sl_poolgc_enable(&e->lp, 1);
 	s->backup = 0;
-	s->backup_last_complete = 0;
+	s->backup_bsn_last_complete = 0;
 	return 0;
 }
 
@@ -254,29 +321,42 @@ int se_scheduler_call(void *arg)
 
 int se_scheduler_init(sescheduler *s, so *env)
 {
+	uint64_t now = ss_utime();
 	ss_mutexinit(&s->lock);
-	s->workers_branch       = 0;
-	s->workers_backup       = 0;
-	s->workers_gc           = 0;
-	s->workers_gc_db        = 0;
-	s->rotate               = 0;
-	s->req                  = 0;
-	s->i                    = NULL;
-	s->count                = 0;
-	s->rr                   = 0;
-	s->env                  = env;
-	s->checkpoint_lsn       = 0;
-	s->checkpoint_lsn_last  = 0;
-	s->checkpoint           = 0;
-	s->age                  = 0;
-	s->age_last             = 0;
-	s->backup_bsn           = 0;
-	s->backup_last          = 0;
-	s->backup_last_complete = 0;
-	s->backup_events        = 0;
-	s->backup               = 0;
-	s->gc                   = 0;
-	s->gc_last              = 0;
+	s->workers_branch           = 0;
+	s->workers_backup           = 0;
+	s->workers_gc               = 0;
+	s->workers_gc_db            = 0;
+	s->workers_lru              = 0;
+	s->rotate                   = 0;
+	s->req                      = 0;
+	s->i                        = NULL;
+	s->count                    = 0;
+	s->rr                       = 0;
+	s->env                      = env;
+	s->checkpoint_lsn           = 0;
+	s->checkpoint_lsn_last      = 0;
+	s->checkpoint               = 0;
+	s->age                      = 0;
+	s->age_last                 = now;
+	s->backup_bsn               = 0;
+	s->backup_bsn_last          = 0;
+	s->backup_bsn_last_complete = 0;
+	s->backup_events            = 0;
+	s->backup                   = 0;
+	s->anticache_asn            = 0;
+	s->anticache_asn_last       = 0;
+	s->anticache_last           = now;
+	s->anticache_storage        = 0;
+	s->anticache                = 0;
+	s->snapshot_ssn             = 0;
+	s->snapshot_ssn_last        = 0;
+	s->snapshot_last            = now;
+	s->snapshot                 = 0;
+	s->gc                       = 0;
+	s->gc_last                  = now;
+	s->lru                      = 0;
+	s->lru_last                 = now;
 	se_workerpool_init(&s->workers);
 	return 0;
 }
@@ -284,7 +364,7 @@ int se_scheduler_init(sescheduler *s, so *env)
 int se_scheduler_shutdown(sescheduler *s)
 {
 	se *e = (se*)s->env;
-	se_requestwakeup(e);
+	se_reqwakeup(e);
 	int rcret = 0;
 	int rc = se_workerpool_shutdown(&s->workers, &e->r);
 	if (ssunlikely(rc == -1))
@@ -380,7 +460,7 @@ int se_scheduler_run(sescheduler *s)
 {
 	se *e = (se*)s->env;
 	int rc;
-	rc = se_workerpool_new(&s->workers, &e->r, e->meta.threads,
+	rc = se_workerpool_new(&s->workers, &e->r, e->conf.threads,
 	                       se_worker, e);
 	if (ssunlikely(rc == -1))
 		return -1;
@@ -436,6 +516,8 @@ se_schedule(sescheduler *s, setask *task, seworker *w)
 	assert(zone != NULL);
 
 	task->checkpoint_complete = 0;
+	task->anticache_complete = 0;
+	task->snapshot_complete = 0;
 	task->backup_complete = 0;
 	task->rotate = 0;
 	task->req = 0;
@@ -444,11 +526,11 @@ se_schedule(sescheduler *s, setask *task, seworker *w)
 
 	ss_mutexlock(&s->lock);
 
-	/* asynchronous requests dispatcher */
+	/* asynchronous reqs dispatcher */
 	if (s->req == 0) {
 		switch (zone->async) {
 		case 2:
-			if (se_requestqueue(e) == 0)
+			if (se_reqqueue(e) == 0)
 				break;
 		case 1:
 			s->req = 1;
@@ -496,6 +578,7 @@ checkpoint:
 	/* apply zone policy */
 	switch (zone->mode) {
 	case 0:  /* compact_index */
+		break;
 	case 1:  /* compact_index + branch_count prio */
 		assert(0);
 		break;
@@ -537,6 +620,78 @@ checkpoint:
 			task->db = db;
 			ss_mutexunlock(&s->lock);
 			return 1;
+		}
+	}
+
+	/* anti-cache */
+	if (s->anticache) {
+		task->plan.plan = SI_ANTICACHE;
+		task->plan.a = s->anticache_asn;
+		task->plan.b = s->anticache_storage;
+		rc = se_schedule_plan(s, &task->plan, &db);
+		switch (rc) {
+		case 1:
+			se_dbref(db, 1);
+			task->db = db;
+			uint64_t size = task->plan.c;
+			if (size > 0) {
+				if (ssunlikely(size > s->anticache_storage))
+					s->anticache_storage = 0;
+				else
+					s->anticache_storage -= size;
+			}
+			ss_mutexunlock(&s->lock);
+			return 1;
+		case 2: /* work in progress */
+			in_progress = 1;
+			break;
+		case 0: /* complete */
+			s->anticache = 0;
+			s->anticache_asn_last = s->anticache_asn;
+			s->anticache_asn = 0;
+			s->anticache_storage = 0;
+			s->anticache_last = now;
+			task->anticache_complete = 1;
+			break;
+		}
+	} else {
+		if (zone->anticache_period) {
+			if ( (now - s->anticache_last) >= ((uint64_t)zone->anticache_period * 1000000) ) {
+				s->anticache = 1;
+				s->anticache_storage = e->conf.anticache;
+				s->anticache_asn = sr_seq(&e->seq, SR_ASNNEXT);
+			}
+		}
+	}
+
+	/* snapshot */
+	if (s->snapshot) {
+		task->plan.plan = SI_SNAPSHOT;
+		task->plan.a = s->snapshot_ssn;
+		rc = se_schedule_plan(s, &task->plan, &db);
+		switch (rc) {
+		case 1:
+			se_dbref(db, 1);
+			task->db = db;
+			ss_mutexunlock(&s->lock);
+			return 1;
+		case 2: /* work in progress */
+			in_progress = 1;
+			break;
+		case 0: /* complete */
+			s->snapshot = 0;
+			s->snapshot_ssn_last = s->snapshot_ssn;
+			s->snapshot_ssn = 0;
+			s->snapshot_last = now;
+			task->snapshot_complete = 1;
+			break;
+		}
+	} else {
+		if (zone->snapshot_period) {
+			if ( (now - s->snapshot_last) >= ((uint64_t)zone->snapshot_period * 1000000) ) {
+				s->snapshot = 1;
+				s->snapshot_ssn = sr_seq(&e->seq, SR_SSNNEXT);
+			}
 		}
 	}
 
@@ -620,6 +775,8 @@ backup_error:;
 			rc = se_schedule_plan(s, &task->plan, &db);
 			switch (rc) {
 			case 1:
+				if (zone->mode == 0)
+					task->plan.plan = SI_COMPACT_INDEX;
 				s->workers_gc++;
 				se_dbref(db, 1);
 				task->db = db;
@@ -641,6 +798,36 @@ backup_error:;
 		}
 	}
 
+	/* lru */
+	if (s->lru) {
+		if (s->workers_lru < zone->lru_prio) {
+			task->plan.plan = SI_LRU;
+			rc = se_schedule_plan(s, &task->plan, &db);
+			switch (rc) {
+			case 1:
+				if (zone->mode == 0)
+					task->plan.plan = SI_COMPACT_INDEX;
+				s->workers_lru++;
+				se_dbref(db, 1);
+				task->db = db;
+				ss_mutexunlock(&s->lock);
+				return 1;
+			case 2: /* work in progress */
+				break;
+			case 0: /* state 3 */
+				s->lru = 0;
+				s->lru_last = now;
+				break;
+			}
+		}
+	} else {
+		if (zone->lru_prio && zone->lru_period) {
+			if ( (now - s->lru_last) >= ((uint64_t)zone->lru_period * 1000000) ) {
+				s->lru = 1;
+			}
+		}
+	}
+
 	/* index aging */
 	if (s->age) {
 		if (s->workers_branch < zone->branch_prio) {
@@ -650,6 +837,8 @@ backup_error:;
 			rc = se_schedule_plan(s, &task->plan, &db);
 			switch (rc) {
 			case 1:
+				if (zone->mode == 0)
+					task->plan.plan = SI_COMPACT_INDEX;
 				s->workers_branch++;
 				se_dbref(db, 1);
 				task->db = db;
@@ -667,6 +856,22 @@ backup_error:;
 				s->age = 1;
 			}
 		}
+	}
+
+	/* compact_index (compaction with in-memory index) */
+	if (zone->mode == 0) {
+		task->plan.plan = SI_COMPACT_INDEX;
+		task->plan.a = zone->branch_wm;
+		rc = se_schedule_plan(s, &task->plan, &db);
+		if (rc == 1) {
+			se_dbref(db, 1);
+			task->db = db;
+			task->gc = 1;
+			ss_mutexunlock(&s->lock);
+			return 1;
+		}
+		ss_mutexunlock(&s->lock);
+		return 0;
 	}
 
 	/* branching */
@@ -703,6 +908,7 @@ backup_error:;
 	/* compaction */
 	task->plan.plan = SI_COMPACT;
 	task->plan.a = zone->compact_wm;
+	task->plan.b = zone->compact_mode;
 	rc = se_schedule_plan(s, &task->plan, &db);
 	if (rc == 1) {
 		se_dbref(db, 1);
@@ -731,7 +937,7 @@ se_rotate(sescheduler *s, seworker *w)
 {
 	ss_trace(&w->trace, "%s", "log rotation");
 	se *e = (se*)s->env;
-	int rc = sl_poolrotate_ready(&e->lp, e->meta.log_rotate_wm);
+	int rc = sl_poolrotate_ready(&e->lp, e->conf.log_rotate_wm);
 	if (rc) {
 		rc = sl_poolrotate(&e->lp);
 		if (ssunlikely(rc == -1))
@@ -741,13 +947,14 @@ se_rotate(sescheduler *s, seworker *w)
 }
 
 static int
-se_execute(setask *t, seworker *w)
+se_run(setask *t, seworker *w)
 {
 	si_plannertrace(&t->plan, &w->trace);
 	sedb *db = t->db;
 	se *e = (se*)db->o.env;
 	uint64_t vlsn = sx_vlsn(&e->xm);
-	return si_execute(&db->index, &w->dc, &t->plan, vlsn);
+	uint64_t vlsn_lru = si_lru_vlsn(&db->index);
+	return si_execute(&db->index, &w->dc, &t->plan, vlsn, vlsn_lru);
 }
 
 static int
@@ -760,10 +967,10 @@ se_dispatch(sescheduler *s, seworker *w, setask *t)
 		int rc = se_active(e);
 		if (ssunlikely(rc == 0))
 			break;
-		serequest *req = se_requestdispatch(e, block);
+		sereq *req = se_reqdispatch(e, block);
 		if (req) {
-			se_query(req);
-			se_requestready(req);
+			se_execute(req);
+			se_reqready(req);
 		}
 	} while (block);
 	return 0;
@@ -782,17 +989,26 @@ se_complete(sescheduler *s, setask *t)
 	case SI_CHECKPOINT:
 		s->workers_branch--;
 		break;
+	case SI_COMPACT_INDEX:
+		break;
 	case SI_BACKUP:
 	case SI_BACKUPEND:
 		s->workers_backup--;
 		break;
+	case SI_SNAPSHOT:
+		break;
+	case SI_ANTICACHE:
+		break;
 	case SI_GC:
 		s->workers_gc--;
+		break;
+	case SI_LRU:
+		s->workers_lru--;
 		break;
 	case SI_SHUTDOWN:
 	case SI_DROP:
 		s->workers_gc_db--;
-		db->o.i->destroy(&db->o);
+		so_destroy(&db->o);
 		break;
 	}
 	if (t->rotate == 1)
@@ -821,9 +1037,9 @@ int se_scheduler(sescheduler *s, seworker *w)
 	}
 	se *e = (se*)s->env;
 	if (task.backup_complete)
-		se_request_on_backup(e);
+		se_reqonbackup(e);
 	if (job) {
-		rc = se_execute(&task, w);
+		rc = se_run(&task, w);
 		if (ssunlikely(rc == -1)) {
 			if (task.plan.plan != SI_BACKUP &&
 			    task.plan.plan != SI_BACKUPEND) {

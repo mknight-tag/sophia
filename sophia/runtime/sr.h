@@ -13,15 +13,16 @@ typedef struct sr sr;
 
 struct sr {
 	srerror *e;
-	sfupdate *fmt_update;
+	sfupsert *fmt_upsert;
 	sfstorage fmt_storage;
 	sf fmt;
 	srscheme *scheme;
 	srseq *seq;
 	ssa *a;
+	ssvfs *vfs;
 	ssquota *quota;
 	ssinjection *i;
-	void *compression;
+	srstat *stat;
 	sscrcf crc;
 };
 
@@ -29,26 +30,28 @@ static inline void
 sr_init(sr *r,
         srerror *e,
         ssa *a,
+        ssvfs *vfs,
         ssquota *quota,
         srseq *seq,
         sf fmt,
         sfstorage fmt_storage,
-        sfupdate *fmt_update,
+        sfupsert *fmt_upsert,
         srscheme *scheme,
         ssinjection *i,
-        sscrcf crc,
-        void *compression)
+		srstat *stat,
+        sscrcf crc)
 {
 	r->e           = e;
 	r->a           = a;
+	r->vfs         = vfs;
 	r->quota       = quota;
 	r->seq         = seq;
 	r->scheme      = scheme;
 	r->fmt         = fmt;
 	r->fmt_storage = fmt_storage;
-	r->fmt_update  = fmt_update;
+	r->fmt_upsert  = fmt_upsert;
 	r->i           = i;
-	r->compression = compression;
+	r->stat        = stat;
 	r->crc         = crc;
 }
 

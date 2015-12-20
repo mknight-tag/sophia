@@ -18,9 +18,11 @@ struct sicachebranch {
 	sdindexpage *ref;
 	sdpage page;
 	ssiter i;
+	ssiter page_iter;
+	ssiter index_iter;
 	ssbuf buf_a;
 	ssbuf buf_b;
-	int iterate;
+	int open;
 	sicachebranch *next;
 } sspacked;
 
@@ -28,7 +30,7 @@ struct sicache {
 	sicachebranch *path;
 	sicachebranch *branch;
 	uint32_t count;
-	uint32_t nodeid;
+	uint64_t nsn;
 	sinode *node;
 	sicache *next;
 	sicachepool *pool;
@@ -48,7 +50,7 @@ si_cacheinit(sicache *c, sicachepool *pool)
 	c->branch = NULL;
 	c->count  = 0;
 	c->node   = NULL;
-	c->nodeid = 0;
+	c->nsn    = 0;
 	c->next   = NULL;
 	c->pool   = pool;
 }
@@ -76,12 +78,13 @@ si_cachereset(sicache *c)
 		ss_bufreset(&cb->buf_b);
 		cb->branch = NULL;
 		cb->ref = NULL;
-		cb->iterate = 0;
+		ss_iterclose(sd_read, &cb->i);
+		cb->open = 0;
 		cb = cb->next;
 	}
 	c->branch = NULL;
 	c->node   = NULL;
-	c->nodeid = 0;
+	c->nsn    = 0;
 	c->count  = 0;
 }
 
@@ -93,7 +96,9 @@ si_cacheadd(sicache *c, sibranch *b)
 		return NULL;
 	nb->branch  = b;
 	nb->ref     = NULL;
-	nb->iterate = 0;
+	memset(&nb->i, 0, sizeof(nb->i));
+	ss_iterinit(sd_read, &nb->i);
+	nb->open    = 0;
 	nb->next    = NULL;
 	ss_bufinit(&nb->buf_a);
 	ss_bufinit(&nb->buf_b);
@@ -103,7 +108,7 @@ si_cacheadd(sicache *c, sibranch *b)
 static inline int
 si_cachevalidate(sicache *c, sinode *n)
 {
-	if (sslikely(c->node == n && c->nodeid == n->self.id.id))
+	if (sslikely(c->node == n && c->nsn == n->self.id.id))
 	{
 		if (sslikely(n->branch_count == c->count)) {
 			c->branch = c->path;
@@ -143,6 +148,8 @@ si_cachevalidate(sicache *c, sinode *n)
 	while (cb && b) {
 		cb->branch = b;
 		cb->ref = NULL;
+		cb->open = 0;
+		ss_iterclose(sd_read, &cb->i);
 		ss_bufreset(&cb->buf_a);
 		ss_bufreset(&cb->buf_b);
 		last = cb;
@@ -162,7 +169,7 @@ si_cachevalidate(sicache *c, sinode *n)
 	}
 	c->count  = n->branch_count;
 	c->node   = n;
-	c->nodeid = n->self.id.id;
+	c->nsn    = n->self.id.id;
 	c->branch = c->path;
 	return 0;
 }
@@ -192,6 +199,7 @@ si_cachepool_free(sicachepool *p, sr *r)
 	while (c) {
 		next = c->next;
 		si_cachefree(c, r);
+		ss_free(p->ac, c);
 		c = next;
 	}
 }

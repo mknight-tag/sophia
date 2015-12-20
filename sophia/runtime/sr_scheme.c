@@ -24,19 +24,20 @@ sr_cmpany(char *prefix, int prefixsz,
 	return 0;
 }
 
-#define sr_compare_u32(a, b) \
-do { \
-	uint32_t av = *(uint32_t*)a; \
-	uint32_t bv = *(uint32_t*)b; \
-	if (av == bv) \
-		return 0; \
-	return (av > bv) ? 1 : -1; \
-} while (0)
+static inline sshot int
+sr_compare_u32(const char *a, const char *b)
+{
+	uint32_t av = sscastu32(a);
+	uint32_t bv = sscastu32(b);
+	if (av == bv)
+		return 0;
+	return (av > bv) ? 1 : -1;
+}
 
 static inline sshot int
 sr_cmpu32_raw(char *a, int asz ssunused, char *b, int bsz ssunused, void *arg ssunused)
 {
-	sr_compare_u32(a, b);
+	return sr_compare_u32(a, b);
 }
 
 static inline sshot int
@@ -45,23 +46,38 @@ sr_cmpu32(char *a, int asz ssunused, char *b, int bsz ssunused, void *arg ssunus
 	int part = ((srkey*)arg)->pos;
 	a = sf_key(a, part);
 	b = sf_key(b, part);
-	sr_compare_u32(a, b);
+	return sr_compare_u32(a, b);
 }
 
-#define sr_compare_u64(a, b) \
-do { \
-	uint64_t av = *(uint64_t*)a; \
-	uint64_t bv = *(uint64_t*)b; \
-	if (av == bv) \
-		return 0; \
-	return (av > bv) ? 1 : -1; \
-} while (0)
+static inline sshot int
+sr_cmpu32_raw_reverse(char *a, int asz ssunused, char *b, int bsz ssunused, void *arg ssunused)
+{
+	return -sr_compare_u32(a, b);
+}
+
+static inline sshot int
+sr_cmpu32_reverse(char *a, int asz ssunused, char *b, int bsz ssunused, void *arg ssunused)
+{
+	int part = ((srkey*)arg)->pos;
+	a = sf_key(a, part);
+	b = sf_key(b, part);
+	return -sr_compare_u32(a, b);
+}
+
+static inline sshot int sr_compare_u64(const char *a, const char *b)
+{
+	uint64_t av = sscastu64(a);
+	uint64_t bv = sscastu64(b);
+	if (av == bv)
+		return 0;
+	return (av > bv) ? 1 : -1;
+}
 
 static inline sshot int
 sr_cmpu64_raw(char *a, int asz ssunused, char *b, int bsz ssunused,
               void *arg ssunused)
 {
-	sr_compare_u64(a, b);
+	return sr_compare_u64(a, b);
 }
 
 static inline sshot int
@@ -70,7 +86,23 @@ sr_cmpu64(char *a, int asz ssunused, char *b, int bsz ssunused, void *arg)
 	int part = ((srkey*)arg)->pos;
 	a = sf_key(a, part);
 	b = sf_key(b, part);
-	sr_compare_u64(a, b);
+	return sr_compare_u64(a, b);
+}
+
+static inline sshot int
+sr_cmpu64_raw_reverse(char *a, int asz ssunused, char *b, int bsz ssunused,
+              void *arg ssunused)
+{
+	return -sr_compare_u64(a, b);
+}
+
+static inline sshot int
+sr_cmpu64_reverse(char *a, int asz ssunused, char *b, int bsz ssunused, void *arg)
+{
+	int part = ((srkey*)arg)->pos;
+	a = sf_key(a, part);
+	b = sf_key(b, part);
+	return -sr_compare_u64(a, b);
 }
 
 static inline sshot int
@@ -165,10 +197,20 @@ int sr_keyset(srkey *part, ssa *a, char *path)
 		cmp = sr_cmpu32;
 		cmpraw = sr_cmpu32_raw;
 	} else
+	if (strcmp(path, "u32_rev") == 0) {
+		type = SS_U32;
+		cmp = sr_cmpu32_reverse;
+		cmpraw = sr_cmpu32_raw_reverse;
+	} else
 	if (strcmp(path, "u64") == 0) {
 		type = SS_U64;
 		cmp = sr_cmpu64;
 		cmpraw = sr_cmpu64_raw;
+	} else
+	if (strcmp(path, "u64_rev") == 0) {
+		type = SS_U64;
+		cmp = sr_cmpu64_reverse;
+		cmpraw = sr_cmpu64_raw_reverse;
 	} else {
 		return -1;
 	}
@@ -225,24 +267,24 @@ int sr_schemeload(srscheme *s, ssa *a, char *buf, int size ssunused)
 {
 	/* count */
 	char *p = buf;
-	uint32_t v = *(uint32_t*)p;
+	uint32_t v = sscastu32(p);
 	p += sizeof(uint32_t);
 	int count = v;
 	int i = 0;
 	int rc;
 	while (i < count) {
-		srkey *key = sr_schemeadd(s, a);
+		srkey *key = sr_schemeadd(s);
 		if (ssunlikely(key == NULL))
 			goto error;
 		/* name */
-		v = *(uint32_t*)p;
+		v = sscastu32(p);
 		p += sizeof(uint32_t);
 		rc = sr_keysetname(key, a, p);
 		if (ssunlikely(rc == -1))
 			goto error;
 		p += v;
 		/* path */
-		v = *(uint32_t*)p;
+		v = sscastu32(p);
 		p += sizeof(uint32_t);
 		rc = sr_keyset(key, a, p);
 		if (ssunlikely(rc == -1))

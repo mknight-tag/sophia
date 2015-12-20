@@ -1,0 +1,19 @@
+#ifndef SD_WRITE_H_
+#define SD_WRITE_H_
+
+/*
+ * sophia database
+ * sphia.org
+ *
+ * Copyright (c) Dmitry Simonenko
+ * BSD License
+*/
+
+int sd_commitpage(sdbuild*, sr*, ssbuf*);
+
+int sd_writeseal(sr*, ssfile*, ssblob*);
+int sd_writepage(sr*, ssfile*, ssblob*, sdbuild*);
+int sd_writeindex(sr*, ssfile*, ssblob*, sdindex*);
+int sd_seal(sr*, ssfile*, ssblob*, sdindex*, uint64_t);
+
+#endif

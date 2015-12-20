@@ -60,7 +60,7 @@ st_generator_kv(stgenerator *g, va_list args)
 	int valuesize = 0;
 	void *value = NULL;
 	if ((g->value_start + g->value_end) > 0) {
-		valuesize = random() % g->value_end;
+		valuesize = rand() % g->value_end;
 		if (valuesize < g->value_start)
 			valuesize = g->value_start;
 		value = ss_malloc(g->r->a, valuesize);
@@ -82,6 +82,7 @@ st_svv_va(stgenerator *g, stlist *l, uint64_t lsn, uint8_t flags, va_list args)
 	case SF_KV: v = st_generator_kv(g, args);
 		break;
 	case SF_DOCUMENT:
+		assert(0);
 		break;
 	}
 	v->lsn = lsn;
@@ -91,7 +92,7 @@ st_svv_va(stgenerator *g, stlist *l, uint64_t lsn, uint8_t flags, va_list args)
 	assert(l->svv == 1);
 	int rc = ss_bufadd(&l->list, g->r->a, &v, sizeof(svv**));
 	if (ssunlikely(rc == -1)) {
-		sv_vfree(g->r->a, v);
+		sv_vfree(g->r, v);
 		return NULL;
 	}
 	return v;
@@ -116,7 +117,7 @@ sv *st_sv(stgenerator *g, stlist *l, uint64_t lsn, uint8_t flags, ...)
 		return NULL;
 	sv *vp = ss_malloc(g->r->a, sizeof(sv));
 	if (vp == NULL) {
-		sv_vfree(g->r->a, v);
+		sv_vfree(g->r, v);
 		return NULL;
 	}
 	sv_init(vp, &sv_vif, v, NULL);
@@ -126,7 +127,7 @@ sv *st_sv(stgenerator *g, stlist *l, uint64_t lsn, uint8_t flags, ...)
 	int rc = ss_bufadd(&l->list, g->r->a, &vp, sizeof(sv**));
 	if (ssunlikely(rc == -1)) {
 		ss_free(g->r->a, vp);
-		sv_vfree(g->r->a, v);
+		sv_vfree(g->r, v);
 		return NULL;
 	}
 	return vp;
@@ -154,6 +155,7 @@ static uint64_t u64parts[16];
 
 svv *st_svv_seed(stgenerator *g, uint32_t seed, uint32_t seed_value)
 {
+	assert(g->r->fmt == SF_KV);
 	srscheme *scheme = g->r->scheme;
 	sfv parts[16];
 	assert(scheme->count <= 16);
@@ -175,9 +177,9 @@ svv *st_svv_seed(stgenerator *g, uint32_t seed, uint32_t seed_value)
 			fv->r.size = sizeof(uint64_t);
 		} else
 		if (scheme->parts[i].type == SS_STRING) {
-			keysize = seed % g->value_end;
-			if (keysize < g->value_start)
-				keysize = g->value_start;
+			keysize = seed % g->key_end;
+			if (keysize < g->key_start)
+				keysize = g->key_start;
 			key = ss_malloc(g->r->a, keysize);
 			if (ssunlikely(key == NULL)) {
 				while (--i >= 0) {

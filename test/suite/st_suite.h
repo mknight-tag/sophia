@@ -15,9 +15,8 @@ struct stsuite {
 	sslist scene;
 	int scene_count;
 	sslist plan;
+	int total;
 	int plan_count;
-	int current;
-	int position;
 	int stop_plan;
 	int stop_group;
 	int stop_test;
@@ -26,8 +25,8 @@ struct stsuite {
 stscene *st_suitescene_of(stsuite*, char*);
 void st_suiteinit(stsuite*);
 void st_suitefree(stsuite*);
-void st_suiteset(stsuite*, int, int, int, int);
-void st_suiterun(stsuite*);
+void st_suiteset(stsuite*, int, int, int);
+void st_suiterun(stsuite*, char*);
 void st_suiteadd(stsuite*, stplan*);
 void st_suiteadd_scene(stsuite*, stscene*);
 

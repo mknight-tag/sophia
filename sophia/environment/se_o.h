@@ -11,19 +11,17 @@
 
 enum {
 	SEUNDEF,
+	SEDESTROYED,
 	SE,
-	SEASYNC,
-	SEMETA,
-	SEMETACURSOR,
-	SEMETAV,
-	SEREQUEST,
-	SEV,
+	SECONF,
+	SECONFCURSOR,
+	SECONFKV,
+	SEREQ,
+	SEDOCUMENT,
 	SEDB,
-	SEDBASYNC,
-	SEBATCH,
+	SEDBCURSOR,
 	SETX,
-	SECURSOR,
-	SESNAPSHOT
+	SECURSOR
 };
 
 extern sotype se_o[];
@@ -36,9 +34,15 @@ se_cast_validate(void *ptr)
 {
 	so *o = ptr;
 	if ((char*)o->type >= (char*)&se_o[0] &&
-	    (char*)o->type <= (char*)&se_o[SESNAPSHOT])
+	    (char*)o->type <= (char*)&se_o[SECURSOR])
 		return ptr;
 	return NULL;
+}
+
+static inline void
+se_mark_destroyed(so *o)
+{
+	so_init(o, &se_o[SEDESTROYED], NULL, NULL, NULL);
 }
 
 #endif

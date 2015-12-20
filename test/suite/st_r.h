@@ -13,7 +13,9 @@ typedef struct str str;
 
 struct str {
 	stconf      *conf;
+	FILE        *output;
 	int          verbose;
+	int          report;
 
 	/* generator */
 	int          key_start;
@@ -25,7 +27,9 @@ struct str {
 
 	/* runtime */
 	ssa          a;
+	ssvfs        vfs;
 	ssinjection  injection;
+	srstat       stat;
 	srscheme     scheme;
 	srerror      error;
 	srseq        seq;
@@ -41,15 +45,18 @@ struct str {
 	/* current */
 	void        *env;
 	void        *db;
-	int          phase_scene;
-	int          phase;
 	sttest      *test;
 	stgroup     *group;
 	stplan      *plan;
 
+	/* current phase */
+	int          phase_compaction_scene;
+	int          phase_compaction;
+
 	/* stats */
 	int          stat_stmt;
 	int          stat_test;
+	time_t       start;
 };
 
 extern str st_r;

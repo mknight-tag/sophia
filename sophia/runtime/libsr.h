@@ -11,10 +11,11 @@
 
 #include <sr_version.h>
 #include <sr_error.h>
+#include <sr_stat.h>
 #include <sr_seq.h>
 #include <sr_scheme.h>
 #include <sr.h>
-#include <sr_meta.h>
+#include <sr_conf.h>
 #include <sr_zone.h>
 
 #endif

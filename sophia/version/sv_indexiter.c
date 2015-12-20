@@ -19,11 +19,3 @@ ssiterif sv_indexiter =
 	.of      = sv_indexiter_of,
 	.next    = sv_indexiter_next
 };
-
-ssiterif sv_indexiterraw =
-{
-	.close   = sv_indexiterraw_close,
-	.has     = sv_indexiterraw_has,
-	.of      = sv_indexiterraw_of,
-	.next    = sv_indexiterraw_next
-};

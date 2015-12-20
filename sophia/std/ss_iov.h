@@ -1,5 +1,5 @@
-#ifndef SD_IOV_H_
-#define SD_IOV_H_
+#ifndef SS_IOV_H_
+#define SS_IOV_H_
 
 /*
  * sophia database

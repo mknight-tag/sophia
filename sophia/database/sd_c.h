@@ -9,20 +9,25 @@
  * BSD License
 */
 
-typedef struct sdc sdc;
 typedef struct sdcbuf sdcbuf;
+typedef struct sdcgc sdcgc;
+typedef struct sdc sdc;
 
 struct sdcbuf {
 	ssbuf a; /* decompression */
 	ssbuf b; /* transformation */
+	ssiter index_iter;
+	ssiter page_iter;
 	sdcbuf *next;
 };
 
 struct sdc {
 	sdbuild build;
+	svupsert upsert;
 	ssbuf a;        /* result */
 	ssbuf b;        /* redistribute buffer */
 	ssbuf c;        /* file buffer */
+	ssbuf d;        /* page read buffer */
 	sdcbuf *head;   /* compression buffer list */
 	int count;
 };
@@ -30,10 +35,12 @@ struct sdc {
 static inline void
 sd_cinit(sdc *sc)
 {
+	sv_upsertinit(&sc->upsert);
 	sd_buildinit(&sc->build);
 	ss_bufinit(&sc->a);
 	ss_bufinit(&sc->b);
 	ss_bufinit(&sc->c);
+	ss_bufinit(&sc->d);
 	sc->count = 0;
 	sc->head = NULL;
 }
@@ -42,9 +49,11 @@ static inline void
 sd_cfree(sdc *sc, sr *r)
 {
 	sd_buildfree(&sc->build, r);
+	sv_upsertfree(&sc->upsert, r);
 	ss_buffree(&sc->a, r->a);
 	ss_buffree(&sc->b, r->a);
 	ss_buffree(&sc->c, r->a);
+	ss_buffree(&sc->d, r->a);
 	sdcbuf *b = sc->head;
 	sdcbuf *next;
 	while (b) {
@@ -57,12 +66,31 @@ sd_cfree(sdc *sc, sr *r)
 }
 
 static inline void
-sd_creset(sdc *sc)
+sd_cgc(sdc *sc, sr *r, int wm)
 {
-	sd_buildreset(&sc->build);
+	sd_buildgc(&sc->build, r, wm);
+	sv_upsertgc(&sc->upsert, r, 600, 512);
+	ss_bufgc(&sc->a, r->a, wm);
+	ss_bufgc(&sc->b, r->a, wm);
+	ss_bufgc(&sc->c, r->a, wm);
+	ss_bufgc(&sc->d, r->a, wm);
+	sdcbuf *b = sc->head;
+	while (b) {
+		ss_bufgc(&b->a, r->a, wm);
+		ss_bufgc(&b->b, r->a, wm);
+		b = b->next;
+	}
+}
+
+static inline void
+sd_creset(sdc *sc, sr *r)
+{
+	sd_buildreset(&sc->build, r);
+	sv_upsertreset(&sc->upsert);
 	ss_bufreset(&sc->a);
 	ss_bufreset(&sc->b);
 	ss_bufreset(&sc->c);
+	ss_bufreset(&sc->d);
 	sdcbuf *b = sc->head;
 	while (b) {
 		ss_bufreset(&b->a);

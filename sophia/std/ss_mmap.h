@@ -22,7 +22,4 @@ ss_mmapinit(ssmmap *m) {
 	m->size = 0;
 }
 
-int ss_mmap(ssmmap*, int, uint64_t, int);
-int ss_munmap(ssmmap*);
-
 #endif

@@ -22,44 +22,28 @@ struct sdindexiter {
 } sspacked;
 
 static inline int
-sd_indexiter_seek(sdindexiter *i, void *key, int size, int *minp, int *midp, int *maxp)
-{
-	int match = 0;
-	int min = 0;
-	int max = i->index->h->count - 1;
-	int mid = 0;
-	while (max >= min)
-	{
-		mid = min + ((max - min) >> 1);
-		sdindexpage *page = sd_indexpage(i->index, mid);
-
-		int rc = sd_indexpage_cmp(i->index, page, key, size, i->r->scheme);
-		switch (rc) {
-		case -1: min = mid + 1;
-			continue;
-		case  1: max = mid - 1;
-			continue;
-		default: match = 1;
-			goto done;
-		}
-	}
-done:
-	*minp = min;
-	*midp = mid;
-	*maxp = max;
-	return match;
-}
-
-static inline int
 sd_indexiter_route(sdindexiter *i)
 {
-	int mid, min, max;
-	int rc = sd_indexiter_seek(i, i->key, i->keysize, &min, &mid, &max);
-	if (sslikely(rc))
-		return mid;
-	if (ssunlikely(min >= (int)i->index->h->count))
-		min = i->index->h->count - 1;
-	return min;
+	int begin = 0;
+	int end = i->index->h->count - 1;
+	while (begin != end) {
+		int mid = begin + (end - begin) / 2;
+		sdindexpage *page = sd_indexpage(i->index, mid);
+		int rc = sr_compare(i->r->scheme,
+		                    sd_indexpage_max(i->index, page),
+		                    page->sizemax,
+		                    i->key,
+		                    i->keysize);
+		if (rc < 0) {
+			begin = mid + 1;
+		} else {
+			/* rc >= 0 */
+			end = mid;
+		}
+	}
+	if (ssunlikely(end >= (int)i->index->h->count))
+		end = i->index->h->count - 1;
+	return end;
 }
 
 static inline int
@@ -73,15 +57,11 @@ sd_indexiter_open(ssiter *i, sr *r, sdindex *index, ssorder o, void *key, int ke
 	ii->keysize = keysize;
 	ii->v       = NULL;
 	ii->pos     = 0;
-	if (ii->index->h->count == 1) {
-		ii->pos = 0;
+	if (ssunlikely(ii->index->h->count == 1)) {
+		/* skip bootstrap node  */
 		if (ii->index->h->lsnmin == UINT64_MAX &&
-		    ii->index->h->lsnmax == 0) {
-			/* skip bootstrap node  */
+		    ii->index->h->lsnmax == 0)
 			return 0;
-		}
-		ii->v = sd_indexpage(ii->index, ii->pos);
-		return 0;
 	}
 	if (ii->key == NULL) {
 		switch (ii->cmp) {
@@ -94,28 +74,30 @@ sd_indexiter_open(ssiter *i, sr *r, sdindex *index, ssorder o, void *key, int ke
 		default:
 			assert(0);
 		}
-	} else {
+		ii->v = sd_indexpage(ii->index, ii->pos);
+		return 0;
+	}
+	if (sslikely(ii->index->h->count > 1))
 		ii->pos = sd_indexiter_route(ii);
-		sdindexpage *p = sd_indexpage(ii->index, ii->pos);
-		switch (ii->cmp) {
-		case SS_LTE: break;
-		case SS_LT: {
-			int l = sr_compare(ii->r->scheme, sd_indexpage_min(ii->index, p), p->sizemin,
-			                   ii->key, ii->keysize);
-			if (ssunlikely(l == 0))
-				ii->pos--;
-			break;
-		}
-		case SS_GTE: break;
-		case SS_GT: {
-			int r = sr_compare(ii->r->scheme, sd_indexpage_max(ii->index, p), p->sizemax,
-			                   ii->key, ii->keysize);
-			if (ssunlikely(r == 0))
-				ii->pos++;
-			break;
-		}
-		default: assert(0);
-		}
+
+	sdindexpage *p = sd_indexpage(ii->index, ii->pos);
+	int rc;
+	switch (ii->cmp) {
+	case SS_LTE:
+	case SS_LT:
+		rc = sr_compare(ii->r->scheme, sd_indexpage_min(ii->index, p),
+		                p->sizemin, ii->key, ii->keysize);
+		if (rc ==  1 || (rc == 0 && ii->cmp == SS_LT))
+			ii->pos--;
+		break;
+	case SS_GTE:
+	case SS_GT:
+		rc = sr_compare(ii->r->scheme, sd_indexpage_max(ii->index, p),
+		                p->sizemax, ii->key, ii->keysize);
+		if (rc == -1 || (rc == 0 && ii->cmp == SS_GT))
+			ii->pos++;
+		break;
+	default: assert(0);
 	}
 	if (ssunlikely(ii->pos == -1 ||
 	               ii->pos >= (int)ii->index->h->count))
@@ -148,12 +130,10 @@ sd_indexiter_next(ssiter *i)
 	sdindexiter *ii = (sdindexiter*)i->priv;
 	switch (ii->cmp) {
 	case SS_LT:
-	case SS_LTE:
-		ii->pos--;
+	case SS_LTE: ii->pos--;
 		break;
 	case SS_GT:
-	case SS_GTE:
-		ii->pos++;
+	case SS_GTE: ii->pos++;
 		break;
 	default:
 		assert(0);

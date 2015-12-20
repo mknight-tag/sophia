@@ -24,20 +24,12 @@ static int
 sy_deploy(sy *e, sr *r)
 {
 	int rc;
-	rc = ss_filemkdir(e->conf->path);
+	rc = ss_vfsmkdir(r->vfs, e->conf->path, 0755);
 	if (ssunlikely(rc == -1)) {
 		sr_error(r->e, "directory '%s' create error: %s",
 		         e->conf->path, strerror(errno));
 		return -1;
 	}
-	return 0;
-}
-
-static inline int
-sy_recover(sy *e, sr *r)
-{
-	(void)e;
-	(void)r;
 	return 0;
 }
 
@@ -76,9 +68,9 @@ sy_recoverbackup(sy *i, sr *r)
 	if (i->conf->path_backup == NULL)
 		return 0;
 	int rc;
-	int exists = ss_fileexists(i->conf->path_backup);
+	int exists = ss_vfsexists(r->vfs, i->conf->path_backup);
 	if (! exists) {
-		rc = ss_filemkdir(i->conf->path_backup);
+		rc = ss_vfsmkdir(r->vfs, i->conf->path_backup, 0755);
 		if (ssunlikely(rc == -1)) {
 			sr_error(r->e, "backup directory '%s' create error: %s",
 					 i->conf->path_backup, strerror(errno));
@@ -120,7 +112,7 @@ int sy_open(sy *e, sr *r, syconf *conf)
 	int rc = sy_recoverbackup(e, r);
 	if (ssunlikely(rc == -1))
 		return -1;
-	int exists = ss_fileexists(conf->path);
+	int exists = ss_vfsexists(r->vfs, conf->path);
 	if (exists == 0) {
 		if (ssunlikely(! conf->path_create)) {
 			sr_error(r->e, "directory '%s' does not exist", conf->path);
@@ -128,7 +120,7 @@ int sy_open(sy *e, sr *r, syconf *conf)
 		}
 		return sy_deploy(e, r);
 	}
-	return sy_recover(e, r);
+	return 0;
 }
 
 int sy_close(sy *e, sr *r)

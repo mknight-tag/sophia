@@ -22,12 +22,12 @@ struct svlogindex {
 
 struct svlogv {
 	sv v;
-	void *vgc;
 	uint32_t id;
 	uint32_t next;
 } sspacked;
 
 struct svlog {
+	int count_write;
 	svlogindex reserve_i[4];
 	svlogv reserve_v[16];
 	ssbuf index;
@@ -35,10 +35,20 @@ struct svlog {
 };
 
 static inline void
+sv_logvinit(svlogv *v, uint32_t id)
+{
+	v->id   = id;
+	v->next = UINT32_MAX;
+	v->v.v  = NULL;
+	v->v.i  = NULL;
+}
+
+static inline void
 sv_loginit(svlog *l)
 {
 	ss_bufinit_reserve(&l->index, l->reserve_i, sizeof(l->reserve_i));
 	ss_bufinit_reserve(&l->buf, l->reserve_v, sizeof(l->reserve_v));
+	l->count_write = 0;
 }
 
 static inline void
@@ -51,6 +61,11 @@ sv_logfree(svlog *l, ssa *a)
 static inline int
 sv_logcount(svlog *l) {
 	return ss_bufused(&l->buf) / sizeof(svlogv);
+}
+
+static inline int
+sv_logcount_write(svlog *l) {
+	return l->count_write;
 }
 
 static inline svlogv*
@@ -72,7 +87,7 @@ sv_logadd(svlog *l, ssa *a, svlogv *v, void *ptr)
 			tail->next = n;
 			i->tail = n;
 			i->count++;
-			return 0;
+			goto done;
 		}
 		i++;
 	}
@@ -88,12 +103,20 @@ sv_logadd(svlog *l, ssa *a, svlogv *v, void *ptr)
 	i->ptr   = ptr;
 	i->count = 1;
 	ss_bufadvance(&l->index, sizeof(svlogindex));
+done:
+	if (! (sv_flags(&v->v) & SVGET))
+		l->count_write++;
 	return 0;
 }
 
 static inline void
 sv_logreplace(svlog *l, int n, svlogv *v)
 {
+	svlogv *ov = sv_logat(l, n);
+	if (! (sv_flags(&ov->v) & SVGET))
+		l->count_write--;
+	if (! (sv_flags(&v->v) & SVGET))
+		l->count_write++;
 	ss_bufset(&l->buf, sizeof(svlogv), n, (char*)v, sizeof(svlogv));
 }
 

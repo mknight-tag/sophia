@@ -19,301 +19,121 @@
 #include <libsy.h>
 #include <libse.h>
 
-int se_txdbwrite(sedb *db, sev *o, int async, uint8_t flags)
-{
-	se *e = se_of(&db->o);
-	/* validate request */
-	if (ssunlikely(o->o.parent != &db->o)) {
-		sr_error(&e->error, "%s", "bad object parent");
-		return -1;
-	}
-	if (ssunlikely(! se_online(&db->status)))
-		goto error;
-	if (flags == SVUPDATE && !sf_updatehas(&db->scheme.fmt_update))
-		flags = 0;
-
-	/* prepare object */
-	svv *v = se_dbv(db, o, 0);
-	if (ssunlikely(v == NULL))
-		goto error;
-	o->o.i->destroy(&o->o);
-	v->flags = flags;
-	sv vp;
-	sv_init(&vp, &sv_vif, v, NULL);
-
-	/* ensure quota */
-	ss_quota(&e->quota, SS_QADD, sizeof(svv) + sv_size(&vp));
-
-	/* asynchronous */
-	if (async) {
-		serequest *task = se_requestnew(e, SE_REQDBSET, &db->o, &db->o);
-		if (ssunlikely(task == NULL)) {
-			sv_vfree(db->r.a, v);
-			return -1;
-		}
-		serequestarg *arg = &task->arg;
-		arg->vlsn_generate = 1;
-		arg->v = vp;
-		se_requestadd(e, task);
-		return 0;
-	}
-
-	/* synchronous */
-	serequest req;
-	se_requestinit(e, &req, SE_REQDBSET, &db->o, &db->o);
-	serequestarg *arg = &req.arg;
-	arg->vlsn_generate = 1;
-	arg->v = vp;
-	se_query(&req);
-	se_requestend(&req);
-	return req.rc;
-error:
-	o->o.i->destroy(&o->o);
-	return -1;
-}
-
-void *se_txdbget(sedb *db, sev *o, int async, uint64_t vlsn, int vlsn_generate)
-{
-	se *e = se_of(&db->o);
-	/* validate request */
-	if (ssunlikely(o->o.parent != &db->o)) {
-		sr_error(&e->error, "%s", "bad object parent");
-		return NULL;
-	}
-	if (ssunlikely(! se_online(&db->status)))
-		goto error;
-
-	/* prepare key object */
-	svv *v = se_dbv(db, o, 1);
-	if (ssunlikely(v == NULL))
-		goto error;
-	o->o.i->destroy(&o->o);
-	sv vp;
-	sv_init(&vp, &sv_vif, v, NULL);
-
-	sicache *cache = si_cachepool_pop(&e->cachepool);
-	if (ssunlikely(cache == NULL)) {
-		sr_oom(&e->error);
-		sv_vfree(db->r.a, v);
-		return NULL;
-	}
-
-	/* asynchronous */
-	if (async)
-	{
-		serequest *task = se_requestnew(e, SE_REQDBGET, &db->o, &db->o);
-		if (ssunlikely(task == NULL)) {
-			sv_vfree(db->r.a, v);
-			si_cachepool_push(cache);
-			return NULL;
-		}
-		serequestarg *arg = &task->arg;
-		arg->v = vp;
-		arg->cache = cache;
-		arg->order = SS_EQ;
-		arg->vlsn_generate = 1;
-		se_requestadd(e, task);
-		return &task->o;
-	}
-
-	/* synchronous */
-	serequest req;
-	se_requestinit(e, &req, SE_REQDBGET, &db->o, &db->o);
-	serequestarg *arg = &req.arg;
-	arg->v = vp;
-	arg->cache = cache;
-	arg->order = SS_EQ;
-	arg->vlsn_generate = vlsn_generate;
-	arg->vlsn = vlsn;
-	int rc = se_query(&req);
-	if (rc == 1) {
-		se_requestresult(&req);
-		se_requestend(&req);
-		return req.result;
-	}
-	se_requestend(&req);
-	return NULL;
-error:
-	o->o.i->destroy(&o->o);
-	return NULL;
-}
-
 static inline int
-se_txwrite(setx *t, sev *o, uint8_t flags)
+se_txwrite(setx *t, sedocument *o, uint8_t flags)
 {
 	se *e = se_of(&t->o);
 	sedb *db = se_cast(o->o.parent, sedb*, SEDB);
-	/* validate request */
-	if (ssunlikely(t->t.s == SXPREPARE)) {
+	/* validate req */
+	if (ssunlikely(t->t.state == SXPREPARE)) {
 		sr_error(&e->error, "%s", "transaction is in 'prepare' state (read-only)");
 		goto error;
 	}
+
 	/* validate database status */
 	int status = se_status(&db->status);
 	switch (status) {
-	case SE_ONLINE:
-	case SE_RECOVER: break;
 	case SE_SHUTDOWN:
 		if (ssunlikely(! se_dbvisible(db, t->t.id))) {
 			sr_error(&e->error, "%s", "database is invisible for the transaction");
 			goto error;
 		}
 		break;
+	case SE_RECOVER:
+	case SE_ONLINE: break;
 	default: goto error;
 	}
-	if (flags == SVUPDATE && !sf_updatehas(&db->scheme.fmt_update))
+	if (flags == SVUPSERT && !sf_upserthas(&db->scheme.fmt_upsert))
 		flags = 0;
-	/* prepare object */
-	svv *v = se_dbv(db, o, 0);
-	if (ssunlikely(v == NULL))
+
+	/* prepare document */
+	svv *v;
+	int rc = se_dbv(db, o, 0, &v);
+	if (ssunlikely(rc == -1))
 		goto error;
 	v->flags = flags;
 	v->log = o->log;
 	sv vp;
 	sv_init(&vp, &sv_vif, v, NULL);
-	o->o.i->destroy(&o->o);
+	so_destroy(&o->o);
 
 	/* ensure quota */
-	ss_quota(&e->quota, SS_QADD, sizeof(svv) + sv_size(&vp));
+	int size = sv_vsize(v);
+	ss_quota(&e->quota, SS_QADD, size);
 
-	/* asynchronous */
-	if (t->async) {
-		serequest *task = se_requestnew(e, SE_REQTXSET, &t->o, &db->o);
-		if (ssunlikely(task == NULL)) {
-			sv_vfree(db->r.a, v);
-			return -1;
-		}
-		serequestarg *arg = &task->arg;
-		arg->v = vp;
-		se_requestadd(e, task);
-		return 0;
+	/* concurrent index only */
+	rc = sx_set(&t->t, &db->coindex, v);
+	if (ssunlikely(rc == -1)) {
+		ss_quota(&e->quota, SS_QREMOVE, size);
+		return -1;
 	}
-
-	/* synchronous */
-	serequest req;
-	se_requestinit(e, &req, SE_REQTXSET, &t->o, &db->o);
-	serequestarg *arg = &req.arg;
-	arg->v = vp;
-	se_query(&req);
-	se_requestend(&req);
-	return req.rc;
+	return 0;
 error:
-	o->o.i->destroy(&o->o);
+	so_destroy(&o->o);
 	return -1;
 }
 
 static int
 se_txset(so *o, so *v)
 {
-	setx  *t = se_cast(o, setx*, SETX);
-	sev *key = se_cast(v, sev*, SEV);
+	setx *t = se_cast(o, setx*, SETX);
+	sedocument *key = se_cast(v, sedocument*, SEDOCUMENT);
 	return se_txwrite(t, key, 0);
 }
 
 static int
-se_txupdate(so *o, so *v)
+se_txupsert(so *o, so *v)
 {
-	setx  *t = se_cast(o, setx*, SETX);
-	sev *key = se_cast(v, sev*, SEV);
-	return se_txwrite(t, key, SVUPDATE);
+	setx *t = se_cast(o, setx*, SETX);
+	sedocument *key = se_cast(v, sedocument*, SEDOCUMENT);
+	return se_txwrite(t, key, SVUPSERT);
 }
 
 static int
 se_txdelete(so *o, so *v)
 {
-	setx  *t = se_cast(o, setx*, SETX);
-	sev *key = se_cast(v, sev*, SEV);
+	setx *t = se_cast(o, setx*, SETX);
+	sedocument *key = se_cast(v, sedocument*, SEDOCUMENT);
 	return se_txwrite(t, key, SVDELETE);
-}
-
-static inline void*
-se_txread(setx *t, sev *o)
-{
-	se *e = se_of(&t->o);
-	sedb *db = se_cast(o->o.parent, sedb*, SEDB);
-
-	/* validate database */
-	int status = se_status(&db->status);
-	switch (status) {
-	case SE_ONLINE:
-	case SE_RECOVER:
-		break;
-	case SE_SHUTDOWN:
-		if (ssunlikely(! se_dbvisible(db, t->t.id))) {
-			sr_error(&e->error, "%s", "database is invisible for the transaction");
-			goto error;
-		}
-		break;
-	default: goto error;
-	}
-
-	/* prepare key object */
-	svv *v = se_dbv(db, o, 1);
-	if (ssunlikely(v == NULL))
-		goto error;
-	sv vp;
-	sv_init(&vp, &sv_vif, v, NULL);
-	o->o.i->destroy(&o->o);
-
-	sicache *cache = si_cachepool_pop(&e->cachepool);
-	if (ssunlikely(cache == NULL)) {
-		sr_oom(&e->error);
-		sv_vfree(db->r.a, v);
-		return NULL;
-	}
-
-	/* asynchronous */
-	if (t->async) {
-		serequest *task = se_requestnew(e, SE_REQTXGET, &t->o, &db->o);
-		if (ssunlikely(task == NULL)) {
-			sv_vfree(db->r.a, v);
-			si_cachepool_push(cache);
-			return NULL;
-		}
-		serequestarg *arg = &task->arg;
-		arg->v = vp;
-		arg->cache = cache;
-		arg->order = SS_EQ;
-		arg->vlsn_generate = 0;
-		se_requestadd(e, task);
-		return &task->o;
-	}
-
-	/* synchronous */
-	serequest req;
-	se_requestinit(e, &req, SE_REQTXGET, &t->o, &db->o);
-	serequestarg *arg = &req.arg;
-	arg->v = vp;
-	arg->cache = cache;
-	arg->order = SS_EQ;
-	arg->vlsn_generate = 0;
-	int rc = se_query(&req);
-	if (rc == 1) {
-		se_requestresult(&req);
-		se_requestend(&req);
-		return req.result;
-	}
-	se_requestend(&req);
-	return NULL;
-error:
-	o->o.i->destroy(&o->o);
-	return NULL;
 }
 
 static void*
 se_txget(so *o, so *v)
 {
 	setx  *t = se_cast(o, setx*, SETX);
-	sev *key = se_cast(v, sev*, SEV);
-	return se_txread(t, key);
+	sedocument *key = se_cast(v, sedocument*, SEDOCUMENT);
+	se *e = se_of(&t->o);
+	sedb *db = se_cast(key->o.parent, sedb*, SEDB);
+	/* validate database */
+	int status = se_status(&db->status);
+	switch (status) {
+	case SE_SHUTDOWN:
+		if (ssunlikely(! se_dbvisible(db, t->t.id))) {
+			sr_error(&e->error, "%s", "database is invisible for the transaction");
+			goto error;
+		}
+		break;
+	case SE_ONLINE:
+	case SE_RECOVER:
+		break;
+	default: goto error;
+	}
+	return se_dbread(db, key, &t->t, 1, NULL, SS_EQ);
+error:
+	so_destroy(&key->o);
+	return NULL;
 }
 
-void se_txend(setx *t)
+static inline void
+se_txend(setx *t, int rlb, int conflict)
 {
 	se *e = se_of(&t->o);
-	sx_gc(&t->t, &e->r);
+	uint32_t count = sv_logcount(&t->t.log);
+	sx_gc(&t->t);
+	sr_stattx(&e->stat, t->start, count, rlb, conflict);
 	se_dbunbind(e, t->t.id);
 	so_listdel(&e->tx, &t->o);
+	se_mark_destroyed(&t->o);
 	ss_free(&e->a_tx, t);
 }
 
@@ -321,62 +141,30 @@ static int
 se_txrollback(so *o)
 {
 	setx *t = se_cast(o, setx*, SETX);
-	se *e = se_of(o);
-	int shutdown = se_status(&e->status) == SE_SHUTDOWN;
-	/* asynchronous */
-	if (!shutdown && t->async) {
-		serequest *task = se_requestnew(e, SE_REQROLLBACK, &t->o, NULL);
-		if (ssunlikely(task == NULL))
-			return -1;
-		se_requestadd(e, task);
-		return 0;
-	}
-	/* synchronous */
-	serequest req;
-	se_requestinit(e, &req, SE_REQROLLBACK, &t->o, NULL);
-	se_query(&req);
-	se_txend(t);
-	return req.rc;
+	sx_rollback(&t->t);
+	se_txend(t, 1, 0);
+	return 0;
 }
 
 static int
-se_txprepare(so *o)
+se_txprepare(sx *x, sv *v, void *arg0, void *arg1)
 {
-	setx *t = se_cast(o, setx*, SETX);
-	se *e = se_of(o);
-	int status = se_status(&e->status);
-	if (ssunlikely(! se_statusactive_is(status)))
-		return -1;
-
-	sicache *cache = si_cachepool_pop(&e->cachepool);
-	if (ssunlikely(cache == NULL))
-		return sr_oom(&e->error);
-
-	/* asynchronous */
-	if (t->async) {
-		serequest *task = se_requestnew(e, SE_REQPREPARE, &t->o, NULL);
-		if (ssunlikely(task == NULL)) {
-			si_cachepool_push(cache);
-			return -1;
-		}
-		serequestarg *arg = &task->arg;
-		arg->recover = (status == SE_RECOVER);
-		arg->cache = cache;
-		se_requestadd(e, task);
-		return 0;
-	}
-
-	/* synchronous */
-	serequest req;
-	se_requestinit(e, &req, SE_REQPREPARE, &t->o, NULL);
-	serequestarg *arg = &req.arg;
-	arg->recover = (status == SE_RECOVER);
-	arg->cache = cache;
-	se_query(&req);
-	se_requestend(&req);
-	if (ssunlikely(req.rc == 1))
-		se_txend(t);
-	return req.rc;
+	sicache *cache = arg0;
+	sedb *db = arg1;
+	se *e = se_of(&db->o);
+	sereq q;
+	se_reqinit(e, &q, SE_REQREAD, &db->o, &db->o);
+	sereqarg *arg = &q.arg;
+	arg->v             = *v;
+	arg->cache         = cache;
+	arg->cachegc       = 0;
+	arg->order         = SS_EQ;
+	arg->has           = 1;
+	arg->vlsn          = x->vlsn;
+	arg->vlsn_generate = 0;
+	se_execute(&q);
+	se_reqend(&q);
+	return q.rc;
 }
 
 static int
@@ -387,21 +175,58 @@ se_txcommit(so *o)
 	int status = se_status(&e->status);
 	if (ssunlikely(! se_statusactive_is(status)))
 		return -1;
+	int recover = (status == SE_RECOVER);
 
-	sicache *cache = si_cachepool_pop(&e->cachepool);
-	if (ssunlikely(cache == NULL))
-		return sr_oom(&e->error);
+	/* prepare transaction */
+	if (t->t.state == SXREADY || t->t.state == SXLOCK)
+	{
+		sicache *cache = NULL;
+		sxpreparef prepare = NULL;
+		if (! recover) {
+			prepare = se_txprepare;
+			cache = si_cachepool_pop(&e->cachepool);
+			if (ssunlikely(cache == NULL))
+				return sr_oom(&e->error);
+		}
+		sxstate s = sx_prepare(&t->t, prepare, cache);
+		if (cache)
+			si_cachepool_push(cache);
+		if (s == SXLOCK) {
+			sr_stattx_lock(&e->stat);
+			return 2;
+		}
+		if (s == SXROLLBACK) {
+			sx_rollback(&t->t);
+			se_txend(t, 0, 1);
+			return 1;
+		}
+		assert(s == SXPREPARE);
 
-	/* prepare commit request */
-	serequest req;
-	se_requestinit(e, &req, SE_REQCOMMIT, &t->o, NULL);
-	serequestarg *arg = &req.arg;
-	arg->cache = cache;
+		sx_commit(&t->t);
+
+		if (t->half_commit) {
+			/* Half commit mode.
+			 *
+			 * A half committed transaction is no longer
+			 * being part of concurrent index, but still can be
+			 * commited or rolled back.
+			 * Yet, it is important to maintain external
+			 * serial commit order.
+			*/
+			return 0;
+		}
+	}
+	assert(t->t.state == SXCOMMIT);
+
+	/* do wal write and backend commit */
+	sereq q;
+	se_reqinit(e, &q, SE_REQWRITE, &t->o, NULL);
+	sereqarg *arg = &q.arg;
+	arg->log = &t->t.log;
 	arg->lsn = 0;
-	if (status == SE_RECOVER || e->meta.commit_lsn)
+	if (recover || e->conf.commit_lsn)
 		arg->lsn = t->lsn;
-	if (ssunlikely(status == SE_RECOVER)) {
-		assert(t->async == 0);
+	if (ssunlikely(recover)) {
 		arg->recover = 1;
 		arg->vlsn_generate = 0;
 		arg->vlsn = sr_seq(e->r.seq, SR_LSN);
@@ -409,33 +234,32 @@ se_txcommit(so *o)
 		arg->vlsn_generate = 1;
 		arg->vlsn = 0;
 	}
-
-	/* asynchronous */
-	if (t->async) {
-		serequest *task = se_requestnew(e, SE_REQCOMMIT, &t->o, NULL);
-		if (ssunlikely(task == NULL))
-			return -1;
-		*task = req;
-		se_requestadd(e, task);
-		return 0;
-	}
-
-	/* synchronous */
-	se_query(&req);
-	se_requestend(&req);
-	if (ssunlikely(req.rc != 2))
-		se_txend(t);
-	return req.rc;
+	se_execute(&q);
+	se_txend(t, 0, 0);
+	return q.rc;
 }
 
 static int
-se_txset_int(so *o, char *path, int64_t v)
+se_txset_int(so *o, const char *path, int64_t v)
 {
 	setx *t = se_cast(o, setx*, SETX);
 	if (strcmp(path, "lsn") == 0) {
 		t->lsn = v;
 		return 0;
+	} else
+	if (strcmp(path, "half_commit") == 0) {
+		t->half_commit = v;
+		return 0;
 	}
+	return -1;
+}
+
+static int64_t
+se_txget_int(so *o, const char *path)
+{
+	setx *t = se_cast(o, setx*, SETX);
+	if (strcmp(path, "deadlock") == 0)
+		return sx_deadlock(&t->t);
 	return -1;
 }
 
@@ -444,28 +268,25 @@ static soif setxif =
 	.open         = NULL,
 	.destroy      = se_txrollback,
 	.error        = NULL,
-	.object       = NULL,
-	.asynchronous = NULL,
+	.document     = NULL,
 	.poll         = NULL,
 	.drop         = NULL,
-	.setobject    = NULL,
 	.setstring    = NULL,
 	.setint       = se_txset_int,
 	.getobject    = NULL,
 	.getstring    = NULL,
-	.getint       = NULL,
+	.getint       = se_txget_int,
 	.set          = se_txset,
-	.update       = se_txupdate,
+	.upsert       = se_txupsert,
 	.del          = se_txdelete,
 	.get          = se_txget,
-	.batch        = NULL,
 	.begin        = NULL,
-	.prepare      = se_txprepare,
+	.prepare      = NULL,
 	.commit       = se_txcommit,
-	.cursor       = NULL,
+	.cursor       = NULL
 };
 
-so *se_txnew(se *e, int async)
+so *se_txnew(se *e)
 {
 	setx *t = ss_malloc(&e->a_tx, sizeof(setx));
 	if (ssunlikely(t == NULL)) {
@@ -475,24 +296,9 @@ so *se_txnew(se *e, int async)
 	memset(t, 0, sizeof(*t));
 	so_init(&t->o, &se_o[SETX], &setxif, &e->o, &e->o);
 	sx_init(&e->xm, &t->t);
-	t->lsn   = 0;
-	t->async = async;
-	/* asynchronous */
-	if (async) {
-		serequest *task = se_requestnew(e, SE_REQBEGIN, &t->o, NULL);
-		if (ssunlikely(task == NULL)) {
-			ss_free(&e->a_tx, t);
-			return NULL;
-		}
-		se_dbbind(e);
-		so_listadd(&e->tx, &t->o);
-		se_requestadd(e, task);
-		return &t->o;
-	}
-	/* synchronous */
-	serequest req;
-	se_requestinit(e, &req, SE_REQBEGIN, &t->o, NULL);
-	se_query(&req);
+	t->start = ss_utime();
+	t->lsn = 0;
+	sx_begin(&e->xm, &t->t, SXRW, 0);
 	se_dbbind(e);
 	so_listadd(&e->tx, &t->o);
 	return &t->o;

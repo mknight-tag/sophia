@@ -18,59 +18,81 @@ typedef struct sdrecover sdrecover;
 struct sdrecover {
 	ssfile *file;
 	int corrupt;
-	sdindexheader *actual;
 	sdindexheader *v;
+	sdindexheader *actual;
+	sdseal *seal;
 	ssmmap map;
 	sr *r;
 } sspacked;
 
 static int
-sd_recovernext_of(sdrecover *i, sdindexheader *next)
+sd_recovernext_of(sdrecover *i, sdseal *next)
 {
 	if (next == NULL)
 		return 0;
-	char *eof   = (char*)i->map.p + i->map.size;
-	char *start = (char*)next;
+
+	char *eof = (char*)i->map.p + i->map.size;
+	char *pointer = (char*)next;
+
 	/* eof */
-	if (ssunlikely(start == eof)) {
+	if (ssunlikely(pointer == eof)) {
 		i->v = NULL;
 		return 0;
 	}
-	/* validate crc */
-	uint32_t crc = ss_crcs(i->r->crc, next, sizeof(sdindexheader), 0);
-	if (next->crc != crc) {
+
+	/* validate seal pointer */
+	if (ssunlikely(((pointer + sizeof(sdseal)) > eof))) {
+		sr_malfunction(i->r->e, "corrupted db file '%s': bad seal size",
+		               ss_pathof(&i->file->path));
+		i->corrupt = 1;
+		i->v = NULL;
+		return -1;
+	}
+	pointer = i->map.p + next->index_offset;
+
+	/* validate index pointer */
+	if (ssunlikely(((pointer + sizeof(sdindexheader)) > eof))) {
+		sr_malfunction(i->r->e, "corrupted db file '%s': bad index size",
+		               ss_pathof(&i->file->path));
+		i->corrupt = 1;
+		i->v = NULL;
+		return -1;
+	}
+	sdindexheader *index = (sdindexheader*)(pointer);
+
+	/* validate index crc */
+	uint32_t crc = ss_crcs(i->r->crc, index, sizeof(sdindexheader), 0);
+	if (index->crc != crc) {
 		sr_malfunction(i->r->e, "corrupted db file '%s': bad index crc",
-		               i->file->file);
+		               ss_pathof(&i->file->path));
 		i->corrupt = 1;
 		i->v = NULL;
 		return -1;
 	}
-	/* check version */
-	if (! sr_versioncheck(&next->version))
-		return sr_malfunction(i->r->e, "bad db file '%s' version",
-		                      i->file->file);
-	char *end = start + sizeof(sdindexheader) + next->size +
-	            next->total +
-	            next->extension + sizeof(sdseal);
-	if (ssunlikely((start > eof || (end > eof)))) {
-		sr_malfunction(i->r->e, "corrupted db file '%s': bad record size",
-		               i->file->file);
+
+	/* validate index size */
+	char *end = pointer + sizeof(sdindexheader) + index->size +
+	            index->extension;
+	if (ssunlikely(end > eof)) {
+		sr_malfunction(i->r->e, "corrupted db file '%s': bad index size",
+		               ss_pathof(&i->file->path));
 		i->corrupt = 1;
 		i->v = NULL;
 		return -1;
 	}
-	/* check seal */
-	sdseal *s = (sdseal*)(end - sizeof(sdseal));
-	int rc = sd_sealvalidate(s, i->r, next);
+
+	/* validate seal */
+	int rc = sd_sealvalidate(next, i->r, index);
 	if (ssunlikely(rc == -1)) {
 		sr_malfunction(i->r->e, "corrupted db file '%s': bad seal",
-		               i->file->file);
+		               ss_pathof(&i->file->path));
 		i->corrupt = 1;
 		i->v = NULL;
 		return -1;
 	}
-	i->actual = next;
-	i->v = next;
+	i->seal = next;
+	i->actual = index;
+	i->v = index;
 	return 1;
 }
 
@@ -80,30 +102,31 @@ int sd_recover_open(ssiter *i, sr *r, ssfile *file)
 	memset(ri, 0, sizeof(*ri));
 	ri->r = r;
 	ri->file = file;
-	if (ssunlikely(ri->file->size < (sizeof(sdindexheader) + sizeof(sdseal)))) {
+	if (ssunlikely(ri->file->size < (sizeof(sdseal) + sizeof(sdindexheader)))) {
 		sr_malfunction(ri->r->e, "corrupted db file '%s': bad size",
-		               ri->file->file);
+		               ss_pathof(&ri->file->path));
 		ri->corrupt = 1;
 		return -1;
 	}
-	int rc = ss_mmap(&ri->map, ri->file->fd, ri->file->size, 1);
+	int rc = ss_vfsmmap(r->vfs, &ri->map, ri->file->fd, ri->file->size, 1);
 	if (ssunlikely(rc == -1)) {
 		sr_malfunction(ri->r->e, "failed to mmap db file '%s': %s",
-		               ri->file->file, strerror(errno));
+		               ss_pathof(&ri->file->path),
+		               strerror(errno));
 		return -1;
 	}
-	sdindexheader *next = (sdindexheader*)((char*)ri->map.p);
-	rc = sd_recovernext_of(ri, next);
+	sdseal *seal = (sdseal*)((char*)ri->map.p);
+	rc = sd_recovernext_of(ri, seal);
 	if (ssunlikely(rc == -1))
-		ss_munmap(&ri->map);
+		ss_vfsmunmap(r->vfs, &ri->map);
 	return rc;
 }
 
 static void
-sd_recoverclose(ssiter *i ssunused)
+sd_recoverclose(ssiter *i)
 {
 	sdrecover *ri = (sdrecover*)i->priv;
-	ss_munmap(&ri->map);
+	ss_vfsmunmap(ri->r->vfs, &ri->map);
 }
 
 static int
@@ -126,11 +149,10 @@ sd_recovernext(ssiter *i)
 	sdrecover *ri = (sdrecover*)i->priv;
 	if (ssunlikely(ri->v == NULL))
 		return;
-	sdindexheader *next =
-		(sdindexheader*)((char*)ri->v +
+	sdseal *next =
+		(sdseal*)((char*)ri->v +
 		    (sizeof(sdindexheader) + ri->v->size) +
-		     ri->v->total +
-		     ri->v->extension + sizeof(sdseal));
+		     ri->v->extension);
 	sd_recovernext_of(ri, next);
 }
 
@@ -145,16 +167,17 @@ ssiterif sd_recover =
 int sd_recover_complete(ssiter *i)
 {
 	sdrecover *ri = (sdrecover*)i->priv;
-	if (ssunlikely(ri->actual == NULL))
+	if (ssunlikely(ri->seal == NULL))
 		return -1;
 	if (sslikely(ri->corrupt == 0))
 		return  0;
-	/* truncate file to the latest actual index */
+	/* truncate file to the end of a latest actual
+	 * index */
 	char *eof =
-		(char*)ri->actual + sizeof(sdindexheader) +
+		(char*)ri->map.p +
+		       ri->actual->offset + sizeof(sdindexheader) +
 		       ri->actual->size +
-		       ri->actual->total +
-		       ri->actual->extension + sizeof(sdseal);
+		       ri->actual->extension;
 	uint64_t file_size = eof - ri->map.p;
 	int rc = ss_fileresize(ri->file, file_size);
 	if (ssunlikely(rc == -1))

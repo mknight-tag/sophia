@@ -16,10 +16,12 @@ struct stconf {
 	char *backup_dir;
 	char *log_dir;
 	char *db_dir;
-	int   position;
+	char *id;
+	char *logfile;
 	int   stop_plan;
 	int   stop_group;
 	int   stop_test;
+	int   report;
 	int   verbose;
 };
 
